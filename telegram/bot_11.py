@@ -1,0 +1,2165 @@
+import os
+import sys
+import aiogram
+import logging
+import asyncio
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+import json
+import random
+import string
+import matplotlib.pyplot as plt
+import re
+import io
+from aiogram.utils.exceptions import MessageNotModified, InvalidQueryID, TelegramAPIError
+from sqlalchemy import create_engine, func, Column, Integer, String, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
+import pandas as pd
+
+# Adiciona o diretório principal ao sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from core.config import TELEGRAM_TOKEN_QA, stores, DATABASE_URL
+from core.models import LastUpdate
+from core.analytics_4 import (
+    comparar_periodo_anterior, obter_datas, mostrar_resultados,
+    mostrar_resultados_percentual, mostrar_resultados_minutos,
+    mostrar_resultados_unidades, mostrar_resultados_devolucoes,
+    mostrar_resultados_descontos, calcular_diferenca,
+    calcular_percentagem_ocupacao, calcular_top_2_regioes_ocupadas,
+    calcular_menos_2_regioes_ocupadas, obter_datas_comparacao
+)
+from conector.space_heatmap import generate_heatmap
+from tasks import processar_dados_pesados
+
+# Função de escape personalizada para o Markdown V2
+def escape_md(text):
+    escape_chars = r'\_*[]()~>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+# Configuração do logger com timestamp
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuração do banco de dados
+DATABASE_URL = 'sqlite:///c:/projetos/grnl_platform/bot_database.db'
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# Variáveis globais para gerenciar timeouts
+interaction_timeouts = {}
+
+# Função de cancelamento de interação
+async def cancel_interaction(chat_id):
+    if chat_id in user_states:
+        del user_states[chat_id]
+    if chat_id in interaction_timeouts:
+        interaction_timeouts[chat_id].cancel()
+        del interaction_timeouts[chat_id]
+    await bot.send_message(chat_id, "⚠️ Sessão encerrada por inatividade. Quando estiver pronto, use /start para começar de novo!")
+
+# Função para definir o timeout de interação
+async def set_interaction_timeout(chat_id, timeout_seconds=300):
+    if chat_id in interaction_timeouts:
+        interaction_timeouts[chat_id].cancel()  # Cancelar timeout anterior, se houver
+    interaction_timeouts[chat_id] = asyncio.create_task(asyncio.sleep(timeout_seconds))
+    await interaction_timeouts[chat_id]
+    await cancel_interaction(chat_id)  # Limpeza do estado ao expirar o timeout
+
+# Função para concluir a interação
+async def concluir_interacao(chat_id):
+    if chat_id in interaction_timeouts:
+        interaction_timeouts[chat_id].cancel()
+        del interaction_timeouts[chat_id]
+    if chat_id in user_states:
+        del user_states[chat_id]
+    await bot.send_message(chat_id, "✅ Interação concluída com sucesso.")
+
+# Função para processar tarefas pesadas com Celery
+async def handle_heavy_task(message: types.Message):
+    print("Recebi o comando /start_heavy_task")
+    await bot.send_message(chat_id=message.chat.id, text="Tarefa iniciada! Você será notificado quando estiver concluída.")
+    
+    # Disparar uma tarefa pesada para Celery
+    result = processar_dados_pesados.apply_async(args=['param1', 'param2'])
+    print(f"Tarefa disparada para Celery com ID: {result.id}")
+    
+    # Verificar o resultado da tarefa mais tarde
+    while not result.ready():
+        print("Esperando tarefa concluir...")
+        await asyncio.sleep(1)
+    
+    result_value = result.get()
+    print(f"Tarefa concluída com resultado: {result_value}")
+    await bot.send_message(chat_id=message.chat.id, text=f"Tarefa concluída! Resultado: {result_value}")
+
+class PeopleCountingData(Base):
+    __tablename__ = 'people_counting_data'
+    id = Column(Integer, primary_key=True)
+    loja = Column(String)
+    ip = Column(String)
+    start_time = Column(DateTime)
+    end_time = Column(DateTime)
+    total_in = Column(Integer)
+    line1_in = Column(Integer)
+    line2_in = Column(Integer)
+    line3_in = Column(Integer)
+    line4_in = Column(Integer)
+
+# Variáveis Globais e Inicialização de Arquivos
+PERIODOS = ["Hoje", "Ontem", "Esta Semana", "Este Mês", "Customizado"]
+CHAT_ID_FILE = 'last_chat_id.txt'
+USER_DATA_FILE = 'user_data.json'
+INVITES_FILE = 'invites.json'
+ALTERATION_CODES_FILE = 'alteration_codes.json'
+SUPER_ADMIN_FILE = 'super_admin.json'
+user_states = {}
+user_data = {}
+invites = {}
+alteration_codes = {}
+super_admin = {}
+
+def load_user_data():
+    global user_data
+    with open(USER_DATA_FILE, 'r') as file:
+        user_data = json.load(file)
+
+def save_user_data():
+    with open(USER_DATA_FILE, 'w') as file:
+        json.dump(user_data, file, indent=4)
+
+def initialize_json_file(file_path, default_content):
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        with open(file_path, 'w') as file:
+            json.dump(default_content, file, indent=4)
+
+# Inicialize o user_data.json com a flag update_notified
+initialize_json_file(USER_DATA_FILE, {})
+load_user_data()
+
+for user_id, data in user_data.items():
+    if 'update_notified' not in data:
+        data['update_notified'] = False  # Adiciona a flag se não existir
+save_user_data()
+
+# Inicialize os arquivos JSON
+initialize_json_file(USER_DATA_FILE, {})
+initialize_json_file(INVITES_FILE, {})
+initialize_json_file(ALTERATION_CODES_FILE, {})
+initialize_json_file(SUPER_ADMIN_FILE, {"chat_id": "", "username": ""})
+
+def save_chat_id(chat_id):
+    with open(CHAT_ID_FILE, 'w') as file:
+        file.write(str(chat_id))
+
+def get_last_chat_id():
+    if os.path.exists(CHAT_ID_FILE):
+        with open(CHAT_ID_FILE, 'r') as file:
+            return file.read().strip()
+    return None
+
+def save_user_data():
+    with open(USER_DATA_FILE, 'w') as file:
+        json.dump(user_data, file, indent=4)
+
+def load_user_data():
+    global user_data
+    with open(USER_DATA_FILE, 'r') as file:
+        user_data = json.load(file)
+
+def save_invites():
+    with open(INVITES_FILE, 'w') as file:
+        json.dump(invites, file, indent=4)
+
+def load_invites():
+    global invites
+    with open(INVITES_FILE, 'r') as file:
+        invites = json.load(file)
+
+def save_alteration_codes():
+    with open(ALTERATION_CODES_FILE, 'w') as file:
+        json.dump(alteration_codes, file, indent=4)
+
+def load_alteration_codes():
+    global alteration_codes
+    with open(ALTERATION_CODES_FILE, 'r') as file:
+        alteration_codes = json.load(file)
+
+def save_super_admin(admin_data):
+    with open(SUPER_ADMIN_FILE, 'w') as file:
+        json.dump(admin_data, file, indent=4)
+
+def load_super_admin():
+    global super_admin
+    if os.path.exists(SUPER_ADMIN_FILE):
+        with open(SUPER_ADMIN_FILE, 'r') as file:
+            super_admin = json.load(file)
+    else:
+        super_admin = {}
+    if 'nivel_acesso' not in super_admin:
+        super_admin['nivel_acesso'] = 'Super Admin'
+
+def generate_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+def get_user_info(message_or_call):
+    if isinstance(message_or_call, types.Message):
+        username = message_or_call.from_user.username if message_or_call.from_user.username else "N/A"
+        chat_id = message_or_call.chat.id
+    elif isinstance(message_or_call, types.CallbackQuery):
+        username = message_or_call.from_user.username if message_or_call.from_user.username else "N/A"
+        chat_id = message_or_call.message.chat.id
+    return f"User: {username}, Chat ID: {chat_id}"
+
+def obter_datas(periodo):
+    now = datetime.now()
+    if periodo == "Hoje":
+        inicio = datetime(now.year, now.month, now.day)
+        fim = inicio + timedelta(days=1) - timedelta(seconds=1)
+    elif periodo == "Ontem":
+        fim = datetime(now.year, now.month, now.day) - timedelta(seconds=1)
+        inicio = fim - timedelta(days=1) + timedelta(seconds=1)
+    elif periodo == "Esta Semana":
+        inicio = datetime(now.year, now.month, now.day) - timedelta(days=now.weekday())
+        fim = inicio + timedelta(days=7) - timedelta(seconds=1)
+    elif periodo == "Este Mês":
+        inicio = datetime(now.year, now.month, 1)
+        next_month = inicio.replace(day=28) + timedelta(days=4)
+        fim = next_month - timedelta(days=next_month.day)
+    else:
+        raise ValueError(f"Período desconhecido: {periodo}")
+    inicio_lp = inicio - timedelta(days=365)
+    fim_lp = fim - timedelta(days=365)
+    return inicio, fim, inicio_lp, fim_lp
+
+# Funções para os Menus
+async def mostrar_menu_inicial(message: types.Message):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔍 Consultas", callback_data="menu_consultas"))
+    markup.add(InlineKeyboardButton("⚙️ Definições", callback_data="menu_definicoes"))
+    markup.add(InlineKeyboardButton("❓ Ajuda", callback_data="help"))
+
+    # Em vez de tentar editar a mensagem, vamos sempre enviar uma nova mensagem
+    await message.answer("👋 Olá! Bem-vindo(a) ao Assistente de Vendas. Por favor, escolha uma das opções abaixo para começar:", reply_markup=markup)
+
+async def menu_consultas(call: types.CallbackQuery):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🏢 Consultar Grupo", callback_data="consultargrupo"))
+    markup.add(InlineKeyboardButton("🏬 Consultar Lojas", callback_data="consultar"))
+    markup.add(InlineKeyboardButton("📊 Exportar dados", callback_data="exportardados"))
+    markup.add(InlineKeyboardButton("🚪 Sair", callback_data="menu_inicial"))
+
+    # Em vez de tentar editar a mensagem, vamos sempre enviar uma nova mensagem
+    await call.message.answer("🔍 Menu de Consultas! Por favor, selecione uma das opções abaixo para iniciar a sua consulta:", reply_markup=markup)
+
+async def menu_definicoes(call: types.CallbackQuery): 
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("👥 Listar Utilizadores", callback_data="listarusuarios"))
+    markup.add(InlineKeyboardButton("✉️ Gerar Convite", callback_data="gerarconvite"))
+    markup.add(InlineKeyboardButton("🔧 Alterar Permissões", callback_data="alterarnivel"))
+    markup.add(InlineKeyboardButton("🗑️ Remover Utilizador", callback_data="apagarutilizador"))
+    markup.add(InlineKeyboardButton("📝 Registar", callback_data="registo"))
+    markup.add(InlineKeyboardButton("🔒 Alterar Minhas Permissões", callback_data="usarcodigo"))
+    markup.add(InlineKeyboardButton("🚪 Sair", callback_data="menu_inicial"))
+
+    # Enviar mensagem com o novo teclado
+    await bot.send_message(chat_id=call.message.chat.id, text="⚙️ Menu de Definições! Escolha uma das opções abaixo para gerir as suas preferências e permissões:", reply_markup=markup)
+
+# Funções de Handler de Mensagem
+async def send_welcome(message: types.Message):
+    chat_id = str(message.chat.id)
+    nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+    
+    if chat_id not in user_data:
+        # Se o utilizador não estiver registado, inicialize com a flag update_notified = False
+        user_data[chat_id] = {
+            "nome": nome_utilizador,
+            "update_notified": False
+        }
+        save_user_data()
+
+    if not user_data[chat_id].get('update_notified', False):
+        # Enviar a mensagem de atualização
+        update_message = escape_md("""
+📢 **Atualização Importante - Versão 2.0 🚀**
+
+Olá! A aplicação de vendas foi atualizada para a versão 2.0 e estamos entusiasmados em partilhar as novas funcionalidades e melhorias consigo! Aqui está um breve resumo das principais mudanças:
+
+1. **Novo Comando /consultargrupo**: Agora pode consultar dados agregados por grupo de lojas, oferecendo uma visão consolidada das métricas do grupo.
+
+2. **Geração de Mapas de Calor e Gráficos de Fluxo**: Após realizar as suas consultas, pode gerar mapas de calor e gráficos de fluxo, visualizando a ocupação das regiões da loja e as taxas de conversão ao longo do dia.
+
+3. **Aprimoramento nos Menus Interativos**: A navegação foi simplificada com menus interativos que facilitam a escolha de opções como "Consultas", "Definições" e "Ajuda".
+
+4. **Comando /usarcodigo**: Agora pode alterar o seu nível de acesso utilizando um código gerado por um administrador.
+
+5. **Melhorias na Exportação de Dados**: O processo de exportação foi refinado, permitindo exportar dados em formato Excel com maior facilidade e precisão.
+
+6. **Novas Funcionalidades de Gestão**: Adicionámos opções para listar utilizadores, gerar convites, alterar permissões e remover utilizadores diretamente pelo bot.
+
+7. **Melhoria Geral na Interface**: Com um design mais intuitivo, ficou mais fácil e rápido aceder às informações que precisa.
+
+Estamos sempre a procurar melhorar a experiência dos nossos utilizadores. Se precisar de ajuda ou quiser explorar mais sobre as novas funcionalidades, utilize o comando /help ou /funcoes.
+
+Aproveite as novidades e boas vendas! 🎉
+        """)
+        await message.answer(update_message, parse_mode='MarkdownV2')
+        
+        # Atualizar a flag para evitar futuras notificações
+        user_data[chat_id]['update_notified'] = True
+        save_user_data()
+
+    # Mostrar o menu inicial após a mensagem de atualização
+    await mostrar_menu_inicial(message)
+    logger.info(f"Comando /start recebido de {get_user_info(message)}")
+
+async def send_help(message: types.Message):
+    try:
+        help_text = """
+🆘 **Instruções de Utilização:**
+
+- Utilize /start para recomeçar a qualquer momento.
+- Consulte /help para ver estas instruções detalhadas.
+
+🔍 **Consultas:**
+
+- Consultar Grupo: Realize uma consulta para um grupo de lojas.
+- Consultar Lojas: Consulte dados específicos de uma loja.
+
+⚙️ **Definições:**
+
+- Listar Utilizadores: Veja a lista de utilizadores registados.
+- Gerar Convite: Crie um convite para novos utilizadores.
+- Alterar Permissões: Modifique o nível de acesso de um utilizador.
+- Remover Utilizador: Remova um utilizador do sistema.
+- Registar: Registe-se no sistema usando um código de convite.
+- Alterar Minhas Permissões: Utilize um código para alterar o seu nível de acesso.
+- Exportar Dados: Exporte dados selecionados para um arquivo Excel.
+
+📊 **Indicadores Explicados:**
+
+- Taxa de Conversão: Percentagem de visitas que resultaram em vendas.
+- Total de Vendas (s/ IVA): Total das vendas sem o imposto.
+- Total de Vendas (c/ IVA): Total das vendas com o imposto.
+- Transações: Número total de vendas realizadas.
+- Visitantes: Número total de pessoas que entraram na loja.
+- Ticket Médio (s/ IVA): Valor médio das vendas, sem impostos.
+- Ticket Médio (c/ IVA): Valor médio das vendas, com impostos.
+- Unidades por Transação: Número médio de unidades vendidas por transação.
+- Tempo Médio de Permanência: Tempo médio que os clientes passam na loja.
+- Número de Passagens: Total de passagens pela frente da loja.
+- Entry Rate: Percentagem de visitantes em relação ao número total de passagens pela frente da loja.
+- Índice de Devoluções: Percentagem do valor devolvido em relação às vendas.
+- Índice de Descontos: Percentagem do valor descontado em relação às vendas.
+
+🏅 Top Vendedores (s/ IVA):
+
+- Top Vendedores: Exibe os vendedores com o maior volume de vendas sem o imposto.
+- Como é calculado: A soma do valor das vendas realizadas por cada vendedor é ordenada para destacar os melhores desempenhos.
+
+🛒 Top Produtos (Qtd):
+
+- Top Produtos: Lista os produtos mais vendidos em termos de quantidade.
+- Como é calculado: Os produtos são ordenados com base no número de unidades vendidas, destacando os itens mais populares.
+
+📉 **Variações:**
+As variações são calculadas comparando o período atual com o período anterior correspondente. A variação percentual é calculada como ((valor atual - valor anterior) / valor anterior) * 100.
+        """
+        await bot.send_message(chat_id=message.chat.id, text=help_text)
+        logger.info(f"Comando /help recebido de {get_user_info(message)}")
+    except Exception as e:
+        logger.error(f"Erro ao enviar mensagem de ajuda: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao enviar mensagem de ajuda: {str(e)}")
+
+async def listar_funcoes(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        user_info = user_data.get(str(chat_id), super_admin)
+        nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+
+        nivel_acesso = user_info.get('nivel_acesso', 'Indefinido')
+
+        comandos = {
+            "Super Admin": ["/consultar", "/consultargrupo", "/gerarconvite", "/apagarutilizador", "/listarusuarios", "/alterarnivel", "/help", "/funcoes", "/usarcodigo", "/exportardados"],
+            "Admin": ["/consultar", "/consultargrupo", "/gerarconvite", "/apagarutilizador", "/listarusuarios", "/alterarnivel", "/help", "/funcoes", "/usarcodigo", "/exportardados"],
+            "Geral": ["/consultar", "/consultargrupo", "/help", "/funcoes", "/usarcodigo"],
+            "Gestor de Grupo": ["/consultar", "/consultargrupo", "/gerarconvite", "/listarusuarios", "/alterarnivel", "/help", "/funcoes", "/usarcodigo", "/exportardados"],
+            "Gestor de Loja": ["/consultar", "/gerarconvite", "/listarusuarios", "/alterarnivel", "/help", "/funcoes", "/usarcodigo", "/exportardados"],
+            "Lojista": ["/consultar", "/help", "/funcoes", "/usarcodigo"]
+        }
+
+        comandos_usuario = comandos.get(nivel_acesso, ["/help"])
+
+        resposta = f"📜 Aqui estão os comandos disponíveis para si, {nome_utilizador}:\n"
+        for comando in comandos_usuario:
+            resposta += f"{comando}\n"
+
+        await bot.send_message(chat_id=message.chat.id, text=resposta)
+    except Exception as e:
+        logger.error(f"Erro ao listar funções: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao listar funções: {str(e)}")
+
+async def registo(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+        if str(chat_id) in user_data:
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Já está registado! Utilize /start para começar ou /help para ver as instruções.")
+            return
+
+        user_states[chat_id] = {'step': 'codigo_convite'}
+        await bot.send_message(chat_id=message.chat.id, text="🔑 Por favor, insira o código de convite:")
+    except Exception as e:
+        logger.error(f"Erro ao iniciar registro: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao iniciar registro: {str(e)}")
+
+async def gerar_convite(call: types.CallbackQuery):
+    chat_id = call.message.chat.id
+    nome_utilizador = call.from_user.first_name if call.from_user.first_name else "Utilizador"
+    if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+        await bot.send_message(chat_id, "🚫 Apenas Super Admins, Admins e gestores podem gerar convites.")
+        return
+
+    user_info = user_data.get(str(chat_id), super_admin)
+    if user_info['nivel_acesso'] == 'Super Admin':
+        niveis_acesso = ["Admin", "Geral", "Gestor de Grupo", "Gestor de Loja", "Lojista"]
+    elif user_info['nivel_acesso'] == 'Admin':
+        niveis_acesso = ["Geral", "Gestor de Grupo", "Gestor de Loja", "Lojista"]
+    elif user_info['nivel_acesso'] == 'Gestor de Grupo':
+        niveis_acesso = ["Gestor de Loja", "Lojista"]
+    elif user_info['nivel_acesso'] == 'Gestor de Loja':
+        niveis_acesso = ["Lojista"]
+
+    user_states[chat_id] = {'step': 'nivel_acesso_convite'}
+    markup = InlineKeyboardMarkup()
+    for nivel in niveis_acesso:
+        markup.add(InlineKeyboardButton(nivel, callback_data=f"nivel_acesso_convite:{nivel}"))
+    markup.add(InlineKeyboardButton("🚪 Sair", callback_data="sair_para_inicial"))
+
+    await bot.edit_message_text("📜 Selecione o nível de acesso para o convite:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+    await call.answer()
+
+async def processar_nivel_acesso_convite(call: types.CallbackQuery):
+    try:
+        chat_id = call.message.chat.id
+        nivel_acesso = call.data.split(":")[1]
+        user_states[chat_id] = {'step': 'grupo_convite', 'nivel_acesso': nivel_acesso}
+        user_info = user_data.get(str(chat_id), super_admin)
+
+         # Enviar feedback ao usuário sobre a escolha
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Você selecionou o nível de acesso: {nivel_acesso} ✅")
+
+        if nivel_acesso in ["Geral", "Admin"]:
+            codigo_convite = generate_code()
+            invites[codigo_convite] = {'nivel_acesso': nivel_acesso, 'grupo': 'Todos'}
+            save_invites()
+
+            # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text=f"🔑 Convite gerado! Envie este código ao utilizador:\n\n{codigo_convite}\n\n[Link para o bot](https://t.me/MainfashionBot)")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🆕✉️ Gerar Novo Convite", callback_data="nova_consulta_gerar_convite"))
+            markup.add(InlineKeyboardButton("🚪 Sair", callback_data="sair_para_inicial"))
+            await bot.send_message(chat_id, "Escolha uma opção:", reply_markup=markup)
+            logger.info(f"Convite gerado: {codigo_convite} para acesso {nivel_acesso}")
+            await call.answer()
+
+        elif nivel_acesso in ["Gestor de Grupo", "Gestor de Loja", "Lojista"]:
+            if user_info['nivel_acesso'] in ['Super Admin', 'Admin'] or (user_info['nivel_acesso'] == 'Gestor de Grupo' and nivel_acesso in ['Gestor de Loja', 'Lojista']) or (user_info['nivel_acesso'] == 'Gestor de Loja' and nivel_acesso == 'Lojista'):
+                markup = InlineKeyboardMarkup()
+                grupos = ["OMNIA", "ONLY"] if user_info['nivel_acesso'] in ['Super Admin', 'Admin'] else [user_info['grupo']]
+                for grupo in grupos:
+                    markup.add(InlineKeyboardButton(grupo, callback_data=f"grupo_convite:{grupo}"))
+                markup.add(InlineKeyboardButton("🚪 Sair", callback_data="sair_para_inicial"))
+
+                # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+                if call.message.reply_markup is not None:
+                    try:
+                        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                    except aiogram.utils.exceptions.MessageNotModified:
+                        logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+                await bot.send_message(chat_id=call.message.chat.id, text="🏢 Selecione o grupo de lojas para o convite:", reply_markup=markup)
+                await call.answer()
+            else:
+                await bot.send_message(chat_id=call.message.chat.id, text="🚫 Você não tem permissão para gerar convites para esse nível de acesso.")
+
+        else:
+            grupo = user_info.get('grupo', 'Indefinido')
+            if grupo == 'Indefinido':
+                if user_info['nivel_acesso'] in ['Super Admin', 'Admin']:
+                    grupo = 'Todos'
+                else:
+                    await bot.send_message(chat_id=call.message.chat.id, text="Erro de configuração: Grupo não definido. Por favor, contate o administrador.")
+                    return
+
+            prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+            lojas_grupo = {k: v for k, v in stores.items() if k.startswith(prefixo_grupo)}
+            user_states[chat_id]['grupo'] = grupo
+
+            markup = InlineKeyboardMarkup()
+            for loja in lojas_grupo:
+                markup.add(InlineKeyboardButton(loja, callback_data=f"loja_convite:{loja}"))
+            markup.add(InlineKeyboardButton("🚪 Sair", callback_data="sair_para_inicial"))
+
+            # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text="🏬 Selecione a loja para o convite:", reply_markup=markup)
+            await call.answer()
+    except Exception as e:
+        logger.error(f"Erro ao processar nível de acesso para convite: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar nível de acesso para convite: {str(e)}")
+
+async def processar_grupo_convite(call: types.CallbackQuery):
+    try:
+        chat_id = call.message.chat.id
+        grupo = call.data.split(":")[1].upper()
+        user_states[chat_id]['grupo'] = grupo
+        nivel_acesso = user_states[chat_id]['nivel_acesso']
+
+        # Enviar feedback ao usuário sobre a escolha
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Você selecionou o grupo: {grupo} ✅")
+
+        if nivel_acesso == "Gestor de Grupo":
+            codigo_convite = generate_code()
+            invites[codigo_convite] = {'nivel_acesso': nivel_acesso, 'grupo': grupo}
+            save_invites()
+
+            # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text=f"🔑 Convite gerado! Envie este código ao utilizador:\n\n{codigo_convite}\n\n[Link para o bot](https://t.me/MainfashionBot)")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("Gerar Novo Convite", callback_data="nova_consulta_gerar_convite"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await bot.send_message(chat_id, "Escolha uma opção:", reply_markup=markup)
+            logger.info(f"Convite gerado: {codigo_convite} para grupo {grupo} com nível {nivel_acesso}")
+            await call.answer()
+        else:
+            prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+            lojas_grupo = {k: v for k, v in stores.items() if k.startswith(prefixo_grupo)}
+            markup = InlineKeyboardMarkup()
+            for loja in lojas_grupo:
+                markup.add(InlineKeyboardButton(loja, callback_data=f"loja_convite:{loja}"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+
+            # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text="🏬 Selecione a loja para o convite:", reply_markup=markup)
+            await call.answer()
+    except Exception as e:
+        logger.error(f"Erro ao processar grupo de convite: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar grupo de convite: {str(e)}")
+
+async def processar_loja_convite(call: types.CallbackQuery):
+    try:
+        chat_id = call.message.chat.id
+        loja = call.data.split(":")[1]
+        grupo = user_states[chat_id]['grupo']
+        nivel_acesso = user_states[chat_id]['nivel_acesso']
+
+        # Enviar feedback ao usuário sobre a escolha
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Você selecionou a loja: {loja} ✅")
+
+        codigo_convite = generate_code()
+        invites[codigo_convite] = {'nivel_acesso': nivel_acesso, 'grupo': grupo, 'loja': loja}
+        save_invites()
+
+        # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+        if call.message.reply_markup is not None:
+            try:
+                await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except aiogram.utils.exceptions.MessageNotModified:
+                logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+        await bot.send_message(chat_id=call.message.chat.id, text=f"🔑 Convite gerado! Envie este código ao utilizador:\n\n{codigo_convite}\n\n[Link para o bot](https://t.me/MainfashionBot)")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Gerar Novo Convite", callback_data="nova_consulta_gerar_convite"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id, "Escolha uma opção:", reply_markup=markup)
+        logger.info(f"Convite gerado: {codigo_convite} para loja {loja} do grupo {grupo} com nível {nivel_acesso}")
+        await call.answer()
+    except Exception as e:
+        logger.error(f"Erro ao processar loja de convite: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar loja de convite: {str(e)}")
+
+async def gerar_codigo_alteracao(call: types.CallbackQuery):
+    chat_id = call.message.chat.id
+    nome_utilizador = call.from_user.first_name if call.from_user.first_name else "Utilizador"
+    if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+        await bot.send_message(chat_id, "🚫 Apenas Admins podem gerar códigos de alteração de nível de acesso.")
+        return
+
+    user_info = user_data.get(str(chat_id), super_admin)
+    if user_info['nivel_acesso'] not in ['Super Admin', 'Admin']:
+        await bot.send_message(chat_id, "🚫 Você não tem permissão para gerar códigos de alteração de nível de acesso.")
+        return
+
+    user_states[chat_id] = {'step': 'nivel_acesso_alteracao'}
+    markup = InlineKeyboardMarkup()
+    niveis_acesso = ["Admin", "Geral", "Gestor de Grupo", "Gestor de Loja", "Lojista"]
+    for nivel in niveis_acesso:
+        markup.add(InlineKeyboardButton(nivel, callback_data=f"nivel_acesso_alteracao:{nivel}"))
+    await bot.send_message(chat_id, "📜 Selecione o nível de acesso para o código de alteração:", reply_markup=markup)
+    await call.answer()
+
+async def processar_nivel_acesso_alteracao(call: types.CallbackQuery):
+    try:
+        chat_id = call.message.chat.id
+        nivel_acesso = call.data.split(":")[1]
+        user_states[chat_id] = {'step': 'codigo_alteracao', 'nivel_acesso': nivel_acesso}
+        user_info = user_data.get(str(chat_id), super_admin)
+
+        # Enviar feedback ao usuário sobre a escolha
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Você selecionou o nível de acesso: {nivel_acesso} ✅")
+
+        if nivel_acesso in ["Geral", "Admin"]:
+            codigo_alteracao = generate_code()
+            invites[codigo_alteracao] = {'nivel_acesso': nivel_acesso, 'grupo': 'Todos'}
+            save_invites()
+
+            # Verifica se o reply_markup não é None antes de tentar editar
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text=f"🔑 Código de alteração gerado! Envie este código ao utilizador:\n\n{codigo_alteracao}\n\n[Link para o bot](https://t.me/MainfashionBot)")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("Outra Alteração", callback_data="nova_consulta_alterar_nivel"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await bot.send_message(chat_id, "Escolha uma opção:", reply_markup=markup)
+            logger.info(f"Código de alteração gerado: {codigo_alteracao} para acesso {nivel_acesso}")
+            await call.answer()
+
+        elif nivel_acesso in ["Gestor de Grupo", "Gestor de Loja", "Lojista"]:
+            if user_info['nivel_acesso'] in ['Super Admin', 'Admin'] or (user_info['nivel_acesso'] == 'Gestor de Grupo' and nivel_acesso in ['Gestor de Loja', 'Lojista']) or (user_info['nivel_acesso'] == 'Gestor de Loja' and nivel_acesso == 'Lojista'):
+                markup = InlineKeyboardMarkup()
+                grupos = ["OMNIA", "ONLY"] if user_info['nivel_acesso'] in ['Super Admin', 'Admin'] else [user_info['grupo']]
+                for grupo in grupos:
+                    markup.add(InlineKeyboardButton(grupo, callback_data=f"grupo_alteracao:{grupo}"))
+                markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+
+                # Verifica se o reply_markup não é None antes de tentar editar
+                if call.message.reply_markup is not None:
+                    try:
+                        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                    except aiogram.utils.exceptions.MessageNotModified:
+                        logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+                await bot.send_message(chat_id=call.message.chat.id, text="🏢 Selecione o grupo de lojas para a alteração:", reply_markup=markup)
+                await call.answer()
+            else:
+                await bot.send_message(chat_id=call.message.chat.id, text="🚫 Você não tem permissão para gerar códigos de alteração para esse nível de acesso.")
+
+        else:
+            grupo = user_info.get('grupo', 'Indefinido')
+            if grupo == 'Indefinido':
+                if user_info['nivel_acesso'] in ['Super Admin', 'Admin']:
+                    grupo = 'Todos'
+                else:
+                    await bot.send_message(chat_id=call.message.chat.id, text="Erro de configuração: Grupo não definido. Por favor, contate o administrador.")
+                    return
+
+            prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+            lojas_grupo = {k: v for k, v in stores.items() if k.startswith(prefixo_grupo)}
+            user_states[chat_id]['grupo'] = grupo
+
+            markup = InlineKeyboardMarkup()
+            for loja in lojas_grupo:
+                markup.add(InlineKeyboardButton(loja, callback_data=f"loja_alteracao:{loja}"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+
+            # Verifica se o reply_markup não é None antes de tentar editar
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text="🏬 Selecione a loja para a alteração:", reply_markup=markup)
+            await call.answer()
+    except Exception as e:
+        logger.error(f"Erro ao processar nível de acesso para alteração: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar nível de acesso para alteração: {str(e)}")
+
+async def processar_grupo_alteracao(call: types.CallbackQuery):
+    try:
+        chat_id = call.message.chat.id
+        grupo = call.data.split(":")[1].upper()
+        user_states[chat_id]['grupo'] = grupo
+        nivel_acesso = user_states[chat_id]['nivel_acesso']
+
+        # Enviar feedback ao usuário sobre a escolha
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Você selecionou o grupo: {grupo} ✅")
+
+        if nivel_acesso == "Gestor de Grupo":
+            codigo_alteracao = generate_code()
+            invites[codigo_alteracao] = {'nivel_acesso': nivel_acesso, 'grupo': grupo}
+            save_invites()
+
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text=f"🔑 Código de alteração gerado! Envie este código ao utilizador:\n\n{codigo_alteracao}\n\n[Link para o bot](https://t.me/MainfashionBot)")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("Outra Alteração", callback_data="nova_consulta_alterar_nivel"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await bot.send_message(chat_id, "Escolha uma opção:", reply_markup=markup)
+            logger.info(f"Código de alteração gerado: {codigo_alteracao} para grupo {grupo} com nível {nivel_acesso}")
+            await call.answer()
+
+        else:
+            prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+            lojas_grupo = {k: v for k, v in stores.items() if k.startswith(prefixo_grupo)}
+            markup = InlineKeyboardMarkup()
+            for loja in lojas_grupo:
+                markup.add(InlineKeyboardButton(loja, callback_data=f"loja_alteracao:{loja}"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+
+            if call.message.reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                except aiogram.utils.exceptions.MessageNotModified:
+                    logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+            await bot.send_message(chat_id=call.message.chat.id, text="🏬 Selecione a loja para a alteração:", reply_markup=markup)
+            await call.answer()
+    except Exception as e:
+        logger.error(f"Erro ao processar grupo de alteração: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar grupo de alteração: {str(e)}")
+
+async def processar_loja_alteracao(call: types.CallbackQuery):
+    try:
+        chat_id = call.message.chat.id
+        loja = call.data.split(":")[1]
+        grupo = user_states[chat_id]['grupo']
+        nivel_acesso = user_states[chat_id]['nivel_acesso']
+
+        # Enviar feedback ao usuário sobre a escolha
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Você selecionou a loja: {loja} ✅")
+
+        codigo_alteracao = generate_code()
+        invites[codigo_alteracao] = {'nivel_acesso': nivel_acesso, 'grupo': grupo, 'loja': loja}
+        save_invites()
+
+        if call.message.reply_markup is not None:
+            try:
+                await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except aiogram.utils.exceptions.MessageNotModified:
+                logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+        await bot.send_message(chat_id=call.message.chat.id, text=f"🔑 Código de alteração gerado! Envie este código ao utilizador:\n\n{codigo_alteracao}\n\n[Link para o bot](https://t.me/MainfashionBot)")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Outra Alteração", callback_data="nova_consulta_alterar_nivel"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id, "Escolha uma opção:", reply_markup=markup)
+        logger.info(f"Código de alteração gerado: {codigo_alteracao} para loja {loja} do grupo {grupo} com nível {nivel_acesso}")
+        await call.answer()
+    except Exception as e:
+        logger.error(f"Erro ao processar loja de alteração: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar loja de alteração: {str(e)}")
+
+async def usarcodigo(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+        if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+            await bot.send_message(chat_id=chat_id, text="❌ Você não está registado. Use /registo para se registar.")
+            return
+
+        user_states[chat_id] = {'step': 'codigo_alteracao'}
+        await bot.send_message(chat_id=chat_id, text="🔑 Por favor, insira o código de alteração de nível de acesso:")
+    except Exception as e:
+        logger.error(f"Erro ao iniciar uso de código de alteração: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao iniciar uso de código de alteração: {str(e)}")
+
+async def processar_codigo_alteracao(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        logger.info(f"Processando código de alteração para chat_id: {chat_id}")
+        codigo_alteracao = message.text
+        nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+        
+        # Verifica se o chat_id pertence a um bot
+        if message.from_user.is_bot:
+            logger.warning(f"Tentativa de envio de mensagem para um bot com chat_id: {chat_id}")
+            await bot.send_message(chat_id=message.chat.id, text="Erro: Tentativa de enviar mensagem para um bot.")
+            return
+        
+        if chat_id in user_states and user_states[chat_id]['step'] == 'codigo_alteracao':
+            if codigo_alteracao not in alteration_codes:
+                await bot.send_message(chat_id=message.chat.id, text="❌ Código de alteração inválido. Tente novamente.")
+                return
+
+            alteration_info = alteration_codes.pop(codigo_alteracao)
+            save_alteration_codes()
+
+            nivel_acesso = alteration_info['nivel_acesso']
+            user_data[str(chat_id)]['nivel_acesso'] = nivel_acesso
+            save_user_data()
+
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Alteração de nível concluída! Agora tem acesso ao nível {nivel_acesso}.")
+            logger.info(f"Utilizador {get_user_info(message)} alterou nível de acesso para: {nivel_acesso}")
+    except Exception as e:
+        logger.error(f"Erro ao processar código de alteração: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao processar código de alteração: {str(e)}")
+
+async def apagar_utilizador(call: types.CallbackQuery):
+    chat_id = call.message.chat.id
+    nome_utilizador = call.from_user.first_name if call.from_user.first_name else "Utilizador"
+    if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+        await bot.send_message(chat_id, "🚫 Apenas Super Admins, Admins e gestores podem apagar utilizadores.")
+        return
+
+    user_states[chat_id] = {'step': 'apagar_usuario'}
+    await bot.send_message(chat_id, "🗑️ Por favor, insira o Chat ID do utilizador a ser removido:")
+    await call.answer()
+
+async def processar_apagar_usuario(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        chat_id_remover = message.text.strip()
+
+        if chat_id_remover not in user_data:
+            await bot.send_message(chat_id=message.chat.id, text="⚠️ Utilizador não encontrado. Por favor, insira um Chat ID válido.")
+            return
+
+        user_info = user_data.get(str(chat_id), super_admin)
+        nivel_acesso = user_info.get('nivel_acesso', 'Indefinido')
+        if nivel_acesso in ['Super Admin', 'Admin'] or (nivel_acesso == 'Gestor de Grupo' and user_data[chat_id_remover]['nivel_acesso'] in ['Gestor de Loja', 'Lojista']) or (nivel_acesso == 'Gestor de Loja' and user_data[chat_id_remover]['nivel_acesso'] == 'Lojista'):
+            del user_data[chat_id_remover]
+            save_user_data()
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Utilizador com Chat ID {chat_id_remover} foi removido com sucesso.")
+            logger.info(f"({chat_id}) removeu o utilizador com Chat ID {chat_id_remover}")
+            # Adicionar botões de "Remover Outro Utilizador" e "Sair"
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("Remover Outro Utilizador", callback_data="nova_consulta_apagar_utilizador"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await bot.send_message(chat_id, "📜 O que você deseja fazer a seguir?", reply_markup=markup)
+        else:
+            await bot.send_message(chat_id=message.chat.id, text="🚫 Você não tem permissão para remover este utilizador.")
+    except Exception as e:
+        logger.error(f"Erro ao apagar utilizador: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao apagar utilizador: {str(e)}")
+
+async def listar_usuarios(call: types.CallbackQuery):
+    chat_id = call.from_user.id
+    nome_utilizador = call.from_user.first_name if call.from_user.first_name else "Utilizador"
+    if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+        await bot.send_message(chat_id, "❌ Não está registado. Utilize /registo para se registar.")
+        return
+
+    nivel_acesso = user_data.get(str(chat_id), super_admin)['nivel_acesso']
+    grupo = user_data.get(str(chat_id), super_admin).get('grupo', 'Todos')
+    loja = user_data.get(str(chat_id), super_admin).get('loja', 'Todas')
+
+    if nivel_acesso not in ['Super Admin', 'Admin', 'Gestor de Grupo', 'Gestor de Loja']:
+        await bot.send_message(chat_id, "🚫 Apenas Super Admins, Admins e gestores podem listar utilizadores.")
+        return
+
+    resposta = "📜 Utilizadores:\n"
+    if nivel_acesso == 'Super Admin' or nivel_acesso == 'Admin':
+        for uid, info in user_data.items():
+            resposta += f"{uid}: {info['username']} - {info['nivel_acesso']}\n"
+    elif nivel_acesso == 'Gestor de Grupo':
+        for uid, info in user_data.items():
+            if info['grupo'] == grupo:
+                resposta += f"{uid}: {info['username']} - {info['nivel_acesso']}\n"
+    elif nivel_acesso == 'Gestor de Loja':
+        for uid, info in user_data.items():
+            if info['loja'] == loja:
+                resposta += f"{uid}: {info['username']} - {info['nivel_acesso']}\n"
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+
+    if call.message.text != resposta or call.message.reply_markup is not None:
+        try:
+            await bot.edit_message_text(resposta, call.message.chat.id, call.message.message_id, reply_markup=None)
+        except MessageNotModified:
+            logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+    else:
+        await call.answer()
+
+    await bot.send_message(chat_id, "Utilize o botão abaixo para sair.", reply_markup=markup)
+
+async def exportardados(message: types.Message):
+    chat_id = message.chat.id
+    nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+    if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+        await bot.send_message(chat_id=message.chat.id, text="❌ Não está registado. Utilize /registo para se registar.")
+        return
+
+    user_info = get_user_info(message)
+    user_record = user_data.get(str(chat_id), super_admin)
+
+    if 'nivel_acesso' not in user_record:
+        await bot.send_message(chat_id=message.chat.id, text="Erro de configuração: Nível de acesso não definido. Por favor, contate o administrador.")
+        return
+
+    nivel_acesso = user_record['nivel_acesso']
+    grupo = user_record.get('grupo', 'Todos')
+    loja = user_record.get('loja', 'Todas')
+
+    if nivel_acesso not in ["Super Admin", "Admin", "Geral"]:
+        await bot.send_message(chat_id=message.chat.id, text="🚫 Apenas Super Admins, Admins e usuários Gerais podem exportar dados.")
+        return
+
+    logger.info(f"Comando /exportardados recebido por {user_info}")
+
+    if nivel_acesso in ["Super Admin", "Admin"]:
+        markup = InlineKeyboardMarkup()
+        grupos = ["OMNIA", "ONLY"]
+        for grupo in grupos:
+            markup.add(InlineKeyboardButton(grupo, callback_data=f"exportar_grupo:{grupo}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id=message.chat.id, text="🏢 Selecione o grupo que deseja consultar:", reply_markup=markup)
+    else:
+        lojas = [loja]
+        markup = InlineKeyboardMarkup()
+        for loja in lojas:
+            markup.add(InlineKeyboardButton(loja, callback_data=f"exportar_loja:{loja}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id=message.chat.id, text="🏬 Selecione a loja que deseja consultar:", reply_markup=markup)
+
+async def process_exportar_grupo(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        grupo = call.data.split(":")[1]
+        await call.answer(f"Grupo selecionado: {grupo} ✅")
+        logger.info(f"Grupo selecionado: {grupo} por {user_info}")
+
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning(f"Mensagem já estava sem markup ou não pôde ser modificada: {call.message.message_id}")
+
+        await bot.send_message(call.message.chat.id, f"Grupo {grupo} selecionado! ✅") 
+
+        prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+        lojas = [loja for loja in stores.keys() if loja.startswith(prefixo_grupo)]
+
+        markup = InlineKeyboardMarkup()
+        for loja in lojas:
+            markup.add(InlineKeyboardButton(loja, callback_data=f"exportar_loja:{loja}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(call.message.chat.id, "🏬 Selecione a loja que deseja consultar:", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao processar grupo para exportação: {str(e)}", exc_info=True)
+        await call.message.reply(f"Erro ao processar grupo para exportação: {str(e)}")
+
+async def process_exportar_loja(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        loja = call.data.split(":")[1]
+        await call.answer(f"Loja selecionada: {loja} ✅")
+        logger.info(f"Loja selecionada: {loja} por {user_info}")
+
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning(f"Mensagem já estava sem markup ou não pôde ser modificada: {call.message.message_id}")
+
+        await bot.send_message(call.message.chat.id, f"Loja {loja} selecionada! ✅") 
+
+        user_states[call.message.chat.id] = {'loja': loja, 'step': 'data_hora_inicio_exportar'}
+        await bot.send_message(call.message.chat.id, "🕒 Insira a data e hora de início para exportação (formato: dd-MM-yyyy HH:00):")
+    except Exception as e:
+        logger.error(f"Erro ao processar loja para exportação: {str(e)}", exc_info=True)
+        await call.message.reply(f"Erro ao processar loja para exportação: {str(e)}")
+
+async def processar_data_hora_inicio_exportar(message: types.Message):
+    try:
+        user_info = get_user_info(message)
+        chat_id = message.chat.id
+        if chat_id in user_states and user_states[chat_id]['step'] == 'data_hora_inicio_exportar':
+            data_hora_inicio = datetime.strptime(message.text, '%d-%m-%Y %H:00')
+            user_states[chat_id]['data_hora_inicio'] = data_hora_inicio
+            user_states[chat_id]['step'] = 'data_hora_fim_exportar'
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Data e hora de início selecionadas: {data_hora_inicio.strftime('%d-%m-%Y %H:00')} ✅")
+            await bot.send_message(chat_id=message.chat.id, text="🕒 Insira a data e hora de fim para exportação (formato: dd-MM-yyyy HH:00):")
+            logger.info(f"Data e hora de início {data_hora_inicio.strftime('%d-%m-%Y %H:00')} selecionadas para a loja {user_states[chat_id]['loja']} por {user_info}")
+    except ValueError:
+        await bot.send_message(chat_id=message.chat.id, text="❌ Formato de data e hora inválido. Por favor, insira no formato: dd-MM-yyyy HH:00")
+
+async def processar_data_hora_fim_exportar(message: types.Message):
+    try:
+        user_info = get_user_info(message)
+        chat_id = message.chat.id
+        if chat_id in user_states and user_states[chat_id]['step'] == 'data_hora_fim_exportar':
+            data_hora_fim = datetime.strptime(message.text, '%d-%m-%Y %H:00') - timedelta(seconds=1)
+            data_hora_inicio = user_states[chat_id]['data_hora_inicio']
+            loja = user_states[chat_id]['loja']
+            user_states[chat_id]['data_hora_fim'] = data_hora_fim
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Data e hora de fim selecionadas: {data_hora_fim.strftime('%d-%m-%Y %H:%M:%S')} ✅")
+            await exportar_dados(message, loja, data_hora_inicio, data_hora_fim)
+            logger.info(f"Data e hora de fim {data_hora_fim.strftime('%d-%m-%Y %H:%M:%S')} selecionadas para a loja {loja} por {user_info}")
+    except ValueError:
+        await bot.send_message(chat_id=message.chat.id, text="❌ Formato de data e hora inválido. Por favor, insira no formato: dd-MM-yyyy HH:00")
+
+async def exportar_dados(message: types.Message, loja, inicio, fim):
+    try:
+        session = Session()
+        dados = session.query(
+            func.date(PeopleCountingData.start_time).label('data'),
+            func.sum(PeopleCountingData.line1_in + PeopleCountingData.line2_in + PeopleCountingData.line3_in).label('total_in')
+        ).filter(
+            PeopleCountingData.loja == loja,
+            PeopleCountingData.start_time >= inicio,
+            PeopleCountingData.end_time <= fim
+        ).group_by(
+            func.date(PeopleCountingData.start_time)
+        ).all()
+        
+        resultados = []
+        for dado in dados:
+            resultados.append({
+                'Data': dado.data,
+                'Total In': dado.total_in
+            })
+
+        df = pd.DataFrame(resultados)
+        nome_arquivo = f'people_counting_{loja}_{inicio.date()}_to_{fim.date()}.xlsx'
+        df.to_excel(nome_arquivo, index=False)
+        
+        with open(nome_arquivo, 'rb') as arquivo:
+            await bot.send_document(message.chat.id, arquivo)
+        os.remove(nome_arquivo)
+        await bot.send_message(message.chat.id, "✅ Exportação concluída com sucesso!")
+        logger.info(f"Arquivo {nome_arquivo} gerado e enviado com sucesso.")
+    except Exception as e:
+        logger.error(f"Erro ao exportar dados: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao exportar dados: {str(e)}")
+    finally:
+        session.close()
+
+    # Adicionar botões para nova consulta ou sair
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Nova Consulta", callback_data="nova_consulta_exportar"))
+    markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+    await bot.send_message(message.chat.id, "📊 Deseja iniciar uma nova consulta ou sair?", reply_markup=markup)
+
+async def consultar(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+        if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+            await message.reply("❌ Não está registado. Utilize /registo para se registar.")
+            return
+        
+        user_info = get_user_info(message)
+        user_record = user_data.get(str(chat_id), super_admin)
+        
+        if 'nivel_acesso' not in user_record:
+            await message.reply("Erro de configuração: Nível de acesso não definido. Por favor, contate o administrador.")
+            return
+        
+        nivel_acesso = user_record['nivel_acesso']
+        grupo = user_record.get('grupo', 'Todos')
+        loja = user_record.get('loja', 'Todas')
+
+        logger.info(f"Comando /consultar recebido por {user_info}")
+
+        if nivel_acesso in ["Super Admin", "Admin", "Geral"]:
+            markup = InlineKeyboardMarkup()
+            grupos = ["OMNIA", "ONLY"]
+            for grupo in grupos:
+                markup.add(InlineKeyboardButton(grupo, callback_data=f"consultar_selecionar_grupo:{grupo}"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await message.reply("🏢 Selecione o grupo que deseja consultar:", reply_markup=markup)
+        elif nivel_acesso == "Gestor de Grupo":
+            prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+            lojas = [loja for loja in stores.keys() if loja.startswith(prefixo_grupo)]
+            markup = InlineKeyboardMarkup()
+            for loja in lojas:
+                markup.add(InlineKeyboardButton(loja, callback_data=f"consultar_selecionar_loja:{loja}"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await message.reply("🏬 Selecione a loja que deseja consultar:", reply_markup=markup)
+        else:
+            lojas = [loja]
+            markup = InlineKeyboardMarkup()
+            for loja in lojas:
+                markup.add(InlineKeyboardButton(loja, callback_data=f"consultar_selecionar_loja:{loja}"))
+            markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+            await message.reply("🏬 Selecione a loja que deseja consultar:", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao configurar consulta: {str(e)}", exc_info=True)
+        await message.reply(f"Erro ao configurar consulta: {str(e)}")
+
+async def processar_selecao_grupo(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        grupo = call.data.split(":")[1]
+
+        # Verifica se já foi enviado
+        if call.message.text == f"Grupo {grupo} selecionado! ✅":
+            return  # Não faz nada se já foi processado
+
+        await bot.edit_message_text(f"Grupo {grupo} selecionado! ✅", call.message.chat.id, call.message.message_id, reply_markup=None)
+
+        logger.info(f"Grupo selecionado: {grupo} por {user_info}")
+
+        prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+        lojas = [loja for loja in stores.keys() if loja.startswith(prefixo_grupo)]
+
+        markup = InlineKeyboardMarkup()
+        for loja in lojas:
+            markup.add(InlineKeyboardButton(loja, callback_data=f"consultar_selecionar_loja:{loja}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(call.message.chat.id, "🏬 Selecione a loja que deseja consultar:", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao processar seleção de grupo: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar seleção de grupo: {str(e)}")
+
+async def processar_selecao_loja(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        loja = call.data.split(":")[1]
+
+        # Verifica se já foi enviado
+        if call.message.text == f"Loja {loja} selecionada! ✅":
+            return  # Não faz nada se já foi processado
+
+        await bot.edit_message_text(f"Loja {loja} selecionada! ✅", call.message.chat.id, call.message.message_id, reply_markup=None)
+
+        logger.info(f"Loja selecionada: {loja} por {user_info}")
+
+        markup = InlineKeyboardMarkup()
+        for periodo in PERIODOS:
+            markup.add(InlineKeyboardButton(periodo, callback_data=f"periodo:{loja}:{periodo}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(call.message.chat.id, "📅 Selecione o período que deseja consultar:", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao processar seleção de loja: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar seleção de loja: {str(e)}")
+
+async def consultar_grupo(message: types.Message):
+    try:
+        chat_id = message.chat.id
+        nome_utilizador = message.from_user.first_name if message.from_user.first_name else "Utilizador"
+        if str(chat_id) not in user_data and str(chat_id) != str(super_admin.get("chat_id")):
+            await bot.send_message(chat_id=message.chat.id, text="❌ Não está registado. Utilize /registo para se registar.")
+            return
+
+        user_info = get_user_info(message)
+        logger.info(f"Comando /consultargrupo recebido por {user_info}")
+
+        markup = InlineKeyboardMarkup()
+        grupos = ["OMNIA", "ONLY"]
+        for grupo in grupos:
+            markup.add(InlineKeyboardButton(grupo, callback_data=f"consultar_grupo:{grupo}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id=message.chat.id, text="🏢 Selecione o grupo que deseja consultar:", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao configurar consulta de grupo: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=message.chat.id, text=f"Erro ao configurar consulta de grupo: {str(e)}")
+
+async def processar_consultar_grupo(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        grupo = call.data.split(":")[1]
+
+        try:
+            await call.answer(f"Grupo selecionado: {grupo} ✅", show_alert=False)
+        except InvalidQueryID:
+            logger.warning("Query ID inválido ou timeout expirado ao responder à callback query.")
+
+        logger.info(f"Grupo selecionado: {grupo} por {user_info}")
+
+        # Verifica se a mensagem já foi modificada
+        if call.message.reply_markup is None:
+            return  # Não faz nada se já foi processado
+
+        # Remove a reply_markup da mensagem anterior
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+        # Envia uma nova mensagem com a seleção do grupo
+        await bot.send_message(call.message.chat.id, f"Grupo {grupo} selecionado! ✅")
+
+        # Agora que o grupo foi selecionado, continue o fluxo para a próxima etapa
+        markup = InlineKeyboardMarkup()
+        for periodo in PERIODOS:
+            markup.add(InlineKeyboardButton(periodo, callback_data=f"periodo_grupo:{grupo}:{periodo}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(call.message.chat.id, "📅 Selecione o período que deseja consultar:", reply_markup=markup)
+
+        # Iniciar timeout
+        asyncio.create_task(set_interaction_timeout(call.message.chat.id))
+
+    except Exception as e:
+        logger.error(f"Erro ao processar grupo para consulta: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar grupo para consulta: {str(e)}")
+
+async def process_consultar_grupo(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        grupo = call.data.split(":")[1]
+
+        # Verifica se já foi enviado
+        if call.message.text == f"Grupo {grupo} selecionado! ✅" or call.message.reply_markup is None:
+            return  # Não faz nada se já foi processado
+
+        try:
+            await call.answer(f"Grupo selecionado: {grupo} ✅", show_alert=False)
+        except InvalidQueryID:
+            logger.warning("Query ID inválido ou timeout expirado ao responder à callback query.")
+
+        logger.info(f"Grupo selecionado: {grupo} por {user_info}")
+
+        # Tenta editar a mensagem, mas só se ela não estiver já editada
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+        await bot.send_message(call.message.chat.id, f"Grupo {grupo} selecionado! ✅") #retirado reply_to_message_id=call.message.message_id
+
+        prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+        lojas = [loja for loja in stores.keys() if loja.startswith(prefixo_grupo)]
+
+        markup = InlineKeyboardMarkup()
+        for loja in lojas:
+            markup.add(InlineKeyboardButton(loja, callback_data=f"consultar_loja:{loja}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(call.message.chat.id, "🏬 Selecione a loja que deseja consultar:", reply_markup=markup)
+        
+        # Iniciar timeout
+        asyncio.create_task(set_interaction_timeout(call.message.chat.id))
+
+    except Exception as e:
+        logger.error(f"Erro ao processar grupo para consulta: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar grupo para consulta: {str(e)}")
+
+async def process_consultar_loja(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        loja = call.data.split(":")[1]
+
+        try:
+            await call.answer(f"Loja selecionada: {loja} ✅", show_alert=False)
+        except InvalidQueryID:
+            logger.warning("Query ID inválido ou timeout expirado ao responder à callback query.")
+
+        logger.info(f"Loja selecionada: {loja} por {user_info}")
+
+        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        await bot.send_message(call.message.chat.id, f"Loja {loja} selecionada! ✅") #retirado reply_to_message_id=call.message.message_id
+
+        markup = InlineKeyboardMarkup()
+        for periodo in PERIODOS:
+            markup.add(InlineKeyboardButton(periodo, callback_data=f"periodo:{loja}:{periodo}"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(call.message.chat.id, "📅 Selecione o período que deseja consultar:", reply_markup=markup)
+        
+        # Iniciar timeout
+        asyncio.create_task(set_interaction_timeout(call.message.chat.id))
+
+    except Exception as e:
+        logger.error(f"Erro ao processar loja para consulta: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar loja para consulta: {str(e)}")
+
+async def process_periodo_step(call: types.CallbackQuery):
+    dados_periodo = call.data.split(":")
+    loja = dados_periodo[1]
+    periodo = dados_periodo[2]
+    user_info = get_user_info(call.message)
+
+    # Verifica se já foi enviado
+    if call.message.reply_markup is None:
+        return  # Não faz nada se já foi processado
+
+    # Remove a reply_markup e envia a mensagem de confirmação
+    try:
+        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        await bot.send_message(call.message.chat.id, f"Período {periodo} selecionado! ✅", reply_to_message_id=call.message.message_id)
+    except aiogram.utils.exceptions.MessageNotModified:
+        pass
+
+    if periodo == "Customizado":
+        user_states[call.message.chat.id] = {'loja': loja, 'step': 'data_hora_inicio'}
+        await bot.send_message(call.message.chat.id, "🕒 Insira a data e hora de início (formato: dd-MM-yyyy HH:00):")
+    else:
+        await processar_periodo(call.message, loja, periodo)
+        logger.info(f"Período {periodo} selecionado para a loja {loja} por {user_info}")
+
+async def processar_data_hora_inicio(message: types.Message):
+    try:
+        user_info = get_user_info(message)
+        chat_id = message.chat.id
+        if chat_id in user_states and user_states[chat_id]['step'] == 'data_hora_inicio':
+            data_hora_inicio = datetime.strptime(message.text, '%d-%m-%Y %H:00')
+            user_states[chat_id]['data_hora_inicio'] = data_hora_inicio
+            user_states[chat_id]['step'] = 'data_hora_fim'
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Data e hora de início selecionadas: {data_hora_inicio.strftime('%d-%m-%Y %H:00')} ✅")
+            await bot.send_message(chat_id=message.chat.id, text="🕒 Insira a data e hora de fim (formato: dd-MM-yyyy HH:00):")
+            logger.info(f"Data e hora de início {data_hora_inicio.strftime('%d-%m-%Y %H:00')} selecionadas para a loja {user_states[chat_id]['loja']} por {user_info}")
+    except ValueError:
+        await bot.send_message(chat_id=message.chat.id, text="❌ Formato de data e hora inválido. Por favor, insira no formato: dd-MM-yyyy HH:00")
+
+async def processar_data_hora_fim(message: types.Message):
+    try:
+        user_info = get_user_info(message)
+        chat_id = message.chat.id
+        if chat_id in user_states and user_states[chat_id]['step'] == 'data_hora_fim':
+            data_hora_fim = datetime.strptime(message.text, '%d-%m-%Y %H:00') - timedelta(seconds=1)
+            data_hora_inicio = user_states[chat_id]['data_hora_inicio']
+            loja = user_states[chat_id]['loja']
+            user_states[chat_id]['data_hora_fim'] = data_hora_fim
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Data e hora de fim selecionadas: {data_hora_fim.strftime('%d-%m-%Y %H:%M:%S')} ✅")
+            await processar_periodo(message, loja, "Customizado", data_hora_inicio, data_hora_fim)
+            logger.info(f"Data e hora de fim {data_hora_fim.strftime('%d-%m-%Y %H:%M:%S')} selecionadas para a loja {loja} por {user_info}")
+    except ValueError:
+        await bot.send_message(chat_id=message.chat.id, text="❌ Formato de data e hora inválido. Por favor, insira no formato: dd-MM-yyyy HH:00")
+
+async def process_periodo_grupo_step(call: types.CallbackQuery):
+    try:
+        dados_periodo = call.data.split(":")
+        grupo = dados_periodo[1]
+        periodo = dados_periodo[2]
+        user_info = get_user_info(call.message)
+
+        # Verifica se a mensagem já foi processada
+        if call.message.text == f"Período {periodo} selecionado! ✅" or call.message.reply_markup is None:
+            return  # Não faz nada se já foi processado
+
+        # Remove a reply_markup da mensagem anterior
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning("Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Período {periodo} selecionado! ✅")
+
+        if periodo == "Customizado":
+            user_states[call.message.chat.id] = {'grupo': grupo, 'step': 'data_hora_inicio_grupo'}
+            await bot.send_message(chat_id=call.message.chat.id, text="🕒 Insira a data e hora de início (formato: dd-MM-yyyy HH:00):")
+        else:
+            await processar_periodo_grupo(call.message, grupo, periodo)
+            logger.info(f"Período {periodo} selecionado para o grupo {grupo} por {user_info}")
+
+    except Exception as e:
+        logger.error(f"Erro ao processar período do grupo: {str(e)}", exc_info=True)
+        await bot.send_message(chat_id=call.message.chat.id, text=f"Erro ao processar período do grupo: {str(e)}")
+
+async def processar_data_hora_inicio_grupo(message: types.Message):
+    try:
+        user_info = get_user_info(message)
+        chat_id = message.chat.id
+        if chat_id in user_states and user_states[chat_id]['step'] == 'data_hora_inicio_grupo':
+            data_hora_inicio = datetime.strptime(message.text, '%d-%m-%Y %H:00')
+            user_states[chat_id]['data_hora_inicio'] = data_hora_inicio
+            user_states[chat_id]['step'] = 'data_hora_fim_grupo'
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Data e hora de início selecionadas: {data_hora_inicio.strftime('%d-%m-%Y %H:00')} ✅")
+            await bot.send_message(chat_id=message.chat.id, text="🕒 Insira a data e hora de fim (formato: dd-MM-yyyy HH:00):")
+            logger.info(f"Data e hora de início {data_hora_inicio.strftime('%d-%m-%Y %H:00')} selecionadas para o grupo {user_states[chat_id]['grupo']} por {user_info}")
+    except ValueError:
+        await bot.send_message(chat_id=message.chat.id, text="❌ Formato de data e hora inválido. Por favor, insira no formato: dd-MM-yyyy HH:00")
+
+async def processar_data_hora_fim_grupo(message: types.Message):
+    try:
+        user_info = get_user_info(message)
+        chat_id = message.chat.id
+        if chat_id in user_states and user_states[chat_id]['step'] == 'data_hora_fim_grupo':
+            data_hora_fim = datetime.strptime(message.text, '%d-%m-%Y %H:00') - timedelta(seconds=1)
+            data_hora_inicio = user_states[chat_id]['data_hora_inicio']
+            grupo = user_states[chat_id]['grupo']
+            user_states[chat_id]['data_hora_fim'] = data_hora_fim
+            await bot.send_message(chat_id=message.chat.id, text=f"✅ Data e hora de fim selecionadas: {data_hora_fim.strftime('%d-%m-%Y %H:%M:%S')} ✅")
+            await processar_periodo_grupo(message, grupo, "Customizado", data_hora_inicio, data_hora_fim)
+            logger.info(f"Data e hora de fim {data_hora_fim.strftime('%d-%m-%Y %H:%M:%S')} selecionadas para o grupo {grupo} por {user_info}")
+    except ValueError:
+        await bot.send_message(chat_id=message.chat.id, text="❌ Formato de data e hora inválido. Por favor, insira no formato: dd-MM-yyyy HH:00")
+
+async def processar_nova_consulta_lojas(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        logger.info(f"Nova consulta solicitada por {user_info}")
+
+        # Tentativa de remover o markup anterior
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning(f"Mensagem já estava sem markup ou não pôde ser modificada: {call.message.message_id}")
+        
+        # Chamar o menu de consultas
+        await menu_consultas(call)
+    except Exception as e:
+        logger.error(f"Erro ao processar nova consulta: {str(e)}", exc_info=True)
+        await bot.send_message(call.message.chat.id, "⚠️ Houve um problema ao iniciar uma nova consulta. Por favor, utilize /consultar para reiniciar o processo.")
+
+async def processar_nova_consulta_grupo(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        logger.info(f"Nova consulta solicitada para grupo por {user_info}")
+
+        # Verifique se a mensagem já está sem marcação antes de tentar removê-la
+        if call.message.reply_markup is not None:
+            try:
+                await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except aiogram.utils.exceptions.MessageNotModified:
+                logger.warning(f"Mensagem não modificada: O conteúdo da mensagem e a marcação são os mesmos.")
+
+        # Chamar o menu de consultas
+        await menu_consultas(call)
+    except Exception as e:
+        logger.error(f"Erro ao processar nova consulta para grupo: {str(e)}", exc_info=True)
+        await bot.send_message(call.message.chat.id, "⚠️ Houve um problema ao iniciar uma nova consulta. Por favor, utilize /consultargrupo para reiniciar o processo.")
+
+def mostrar_resultados(atual, anterior, descricao, monetario=False):
+    diferenca = calcular_diferenca(atual, anterior)
+    direcao = "🟢" if diferenca >= 0 else "🔴"
+    valor_atual = f"€{atual:.2f}" if monetario else f"{int(atual)}"
+    return f"{descricao}: {valor_atual} | {diferenca:.2f}% {direcao}"
+
+def mostrar_resultados_percentual(atual, anterior, descricao):
+    diferenca = calcular_diferenca(atual, anterior)
+    direcao = "🟢" if diferenca >= 0 else "🔴"
+    valor_atual = f"{atual:.2f}%"
+    return f"{descricao}: {valor_atual} | {diferenca:.2f}% {direcao}"
+
+def mostrar_resultados_minutos(atual, anterior, descricao):
+    if atual == 0:
+        valor_atual = "0 min"
+    else:
+        valor_atual = f"{atual:.2f} min"
+    diferenca = calcular_diferenca(atual, anterior)
+    direcao = "🟢" if diferenca >= 0 else "🔴"
+    return f"{descricao}: {valor_atual} | {diferenca:.2f}% {direcao}"
+
+def mostrar_resultados_unidades(atual, anterior, descricao):
+    diferenca = calcular_diferenca(atual, anterior)
+    direcao = "🟢" if diferenca >= 0 else "🔴"
+    return f"{descricao}: {atual:.2f} u. | {diferenca:.2f}% {direcao}"
+
+def mostrar_resultados_devolucoes(atual, anterior, descricao):
+    diferenca = calcular_diferenca(atual, anterior)
+    direcao = "🟢" if diferenca >= 0 else "🔴"
+    valor_atual = f"{atual:.2f}%" if isinstance(atual, (int, float)) else "0%"
+    return f"{descricao}: {valor_atual} | {diferenca:.2f}% {direcao}"
+
+def mostrar_resultados_descontos(atual, anterior, descricao):
+    diferenca = calcular_diferenca(atual, anterior)
+    direcao = "🟢" if diferenca >= 0 else "🔴"
+    valor_atual = f"{atual:.2f}%" if isinstance(atual, (int, float)) else "0%"
+    return f"{descricao}: {valor_atual} | {diferenca:.2f}% {direcao}"
+
+def mostrar_resultados_ocupacao(valor_atual, valor_anterior, descricao):
+    diferenca = calcular_diferenca(valor_atual, valor_anterior)
+    cor = "🟢" if diferenca > 0 else "🔴"
+    return f"{descricao}: {valor_atual:.2f}% | {diferenca:.2f}% {cor}"
+
+async def processar_periodo(call_or_message, loja, periodo, inicio=None, fim=None):
+    mensagem_carregando = None
+    chat_id = call_or_message.chat.id
+    message_id = call_or_message.message_id
+
+    try:
+        user_info = get_user_info(call_or_message)
+        
+        now = datetime.now()
+        if not inicio or not fim:
+            inicio, fim, inicio_lp, fim_lp = obter_datas_comparacao(periodo, now)
+        else:
+            inicio_lp, fim_lp = obter_datas_comparacao("Customizado", now)
+        
+        logger.info(f"Período selecionado: {periodo} para a loja {loja} por {user_info}")
+
+        try:
+            await bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+        except:
+            logger.warning(f"Não foi possível editar a mensagem: {message_id}")
+
+        mensagem_carregando = await bot.send_message(chat_id, "⏳ Carregando os dados, por favor aguarde um momento.")
+
+        resultados_atuais, resultados_anteriores = comparar_periodo_anterior(loja, inicio, fim, now)
+
+        # Calcular a percentagem de ocupação das regiões para o período atual e anterior
+        ocupacao_atual = calcular_percentagem_ocupacao(loja, inicio, fim)
+        ocupacao_anterior = calcular_percentagem_ocupacao(loja, inicio_lp, fim_lp)
+
+        # Obter as duas regiões mais ocupadas
+        top_2_ocupacao_atual = calcular_top_2_regioes_ocupadas(ocupacao_atual)
+        top_2_ocupacao_anterior = {regiao: ocupacao_anterior.get(regiao, 0) for regiao, _ in top_2_ocupacao_atual}
+        # Obter as duas regiões menos ocupadas
+        menos_2_ocupacao_atual = calcular_menos_2_regioes_ocupadas(ocupacao_atual)
+        menos_2_ocupacao_anterior = {regiao: ocupacao_anterior.get(regiao, 0) for regiao, _ in menos_2_ocupacao_atual}
+
+        # Log para verificar se ocupacao_regioes está presente nos resultados
+        logger.info(f"Resultados atuais: {resultados_atuais}")
+        logger.info(f"Resultados anteriores: {resultados_anteriores}")
+        logger.info(f"Ocupação atual: {ocupacao_atual}")
+        logger.info(f"Ocupação anterior: {ocupacao_anterior}")
+        logger.info(f"Top 2 ocupação atual: {top_2_ocupacao_atual}")
+        logger.info(f"Menos 2 ocupação atual: {menos_2_ocupacao_atual}")
+
+        saudacao = "Bom dia" if datetime.now().hour < 12 else "Boa tarde" if datetime.now().hour < 18 else "Boa noite"
+        
+        resposta = f"{saudacao}, {user_info.split(':')[1].split(',')[0]}! 🌞\n\n"
+        resposta += f"**Resumo para a loja {loja} de {inicio.strftime('%Y-%m-%d %H:%M')} a {fim.strftime('%Y-%m-%d %H:%M')}:** 📊\n\n"
+        resposta += f"**Indicadores de Desempenho:** 📈\n\n"
+        resposta += mostrar_resultados(resultados_atuais['total_vendas_com_iva'], resultados_anteriores['total_vendas_com_iva'], "Total de Vendas (c/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados(resultados_atuais['total_vendas_sem_iva'], resultados_anteriores['total_vendas_sem_iva'], "Total de Vendas (s/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados(resultados_atuais['transacoes_vendas'], resultados_anteriores['transacoes_vendas'], "Transações") + "\n"
+        resposta += mostrar_resultados(resultados_atuais['visitantes'], resultados_anteriores['visitantes'], "Visitantes") + "\n"
+        resposta += mostrar_resultados_percentual(resultados_atuais['taxa_conversao'], resultados_anteriores['taxa_conversao'], "Taxa de Conversão") + "\n"
+        resposta += mostrar_resultados_minutos(resultados_atuais['tempo_medio_permanencia'], resultados_anteriores['tempo_medio_permanencia'], "Tempo Médio de Permanência") + "\n"
+        
+        resposta += mostrar_resultados(resultados_atuais['total_passagens'], resultados_anteriores['total_passagens'], "Número de Passagens") + "\n"
+        resposta += mostrar_resultados_percentual(resultados_atuais['entry_rate'], resultados_anteriores['entry_rate'], "Taxa de Captação") + "\n"
+
+        # Adicionar as duas regiões mais ocupadas se disponíveis
+        if top_2_ocupacao_atual:
+            resposta += "\n**Hot Spots:** 🔥\n\n"
+            for regiao, percentagem in top_2_ocupacao_atual:
+                resposta += mostrar_resultados_ocupacao(percentagem, top_2_ocupacao_anterior.get(regiao, 0), regiao) + "\n"
+
+        # Adicionar as duas regiões menos ocupadas se disponíveis
+        if menos_2_ocupacao_atual:
+            resposta += "\n**Cold Spots:** ❄️\n\n"
+            for regiao, percentagem in menos_2_ocupacao_atual:
+                resposta += mostrar_resultados_ocupacao(percentagem, menos_2_ocupacao_anterior.get(regiao, 0), regiao) + "\n"
+
+        resposta += "\n**Indicadores de Eficiência:** 🛠️\n\n"
+        resposta += mostrar_resultados(resultados_atuais['ticket_medio_com_iva'], resultados_anteriores['ticket_medio_com_iva'], "Ticket Médio (c/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados(resultados_atuais['ticket_medio_sem_iva'], resultados_anteriores['ticket_medio_sem_iva'], "Ticket Médio (s/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados_unidades(resultados_atuais['unidades_por_transacao'], resultados_anteriores['unidades_por_transacao'], "Unidades por Transação") + "\n"
+        resposta += mostrar_resultados_devolucoes(resultados_atuais['indice_devolucoes'], resultados_anteriores['indice_devolucoes'], "Índice de Devoluções") + "\n"
+        resposta += mostrar_resultados_descontos(resultados_atuais['indice_descontos'], resultados_anteriores['indice_descontos'], "Índice de Descontos") + "\n"
+        
+        resposta += "\n**Top Vendedores (s/IVA):** 🏅\n\n"
+        for vendedor, valor in resultados_atuais['top_vendedores']:
+            resposta += f"{vendedor}: €{valor:.0f}" + "\n"
+
+        resposta += "\n**Top Produtos (Qtd):** 🛒\n\n"
+        for item, descritivo, quantidade in resultados_atuais['top_produtos']:
+            resposta += f"{descritivo} ({item}): {quantidade:.0f} u." + "\n"
+        
+        resposta += f"\nÚltima atualização dos dados: {resultados_atuais['ultima_coleta'].strftime('%Y-%m-%d %H:%M')} 📅\n\n"
+
+        resposta += f"\nPeríodo de comparação: {inicio_lp.strftime('%Y-%m-%d %H:%M')} a {fim_lp.strftime('%Y-%m-%d %H:%M')} 🕒\n\n"
+
+        resposta = escape_md(resposta)
+
+        await asyncio.sleep(3)
+        if mensagem_carregando:
+            await bot.delete_message(chat_id, mensagem_carregando.message_id)
+        await bot.send_message(chat_id, resposta, parse_mode='MarkdownV2')
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Mapa de Calor", callback_data=f"heatmap:{loja}:{periodo}"))
+        markup.add(InlineKeyboardButton("Nova Consulta", callback_data="nova_consulta_lojas"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id, "📊 Deseja obter o Mapa de Calor para este período ou iniciar uma nova consulta?", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao processar período: {str(e)}", exc_info=True)
+        await asyncio.sleep(3)
+        if mensagem_carregando:
+            await bot.delete_message(chat_id, mensagem_carregando.message_id)
+        await bot.send_message(chat_id, "⚠️ Houve um problema. Por favor, utilize /consultar para reiniciar o processo.")
+
+async def processar_periodo_grupo(call_or_message, grupo, periodo, inicio=None, fim=None):
+    mensagem_carregando = None
+    chat_id = call_or_message.chat.id
+    message_id = call_or_message.message_id
+    session = Session()
+
+    try:
+        user_info = get_user_info(call_or_message)
+        
+        now = datetime.now()
+        if not inicio or not fim:
+            if periodo == "Customizado":
+                raise ValueError(f"Período desconhecido: {periodo}")
+            inicio, fim, inicio_lp, fim_lp = obter_datas_comparacao(periodo, now)
+        else:
+            inicio_lp, fim_lp = obter_datas_comparacao("Customizado", now)
+
+        logger.info(f"Período selecionado: {periodo} para o grupo {grupo} por {user_info}")
+
+        try:
+            await bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+        except:
+            logger.warning(f"Não foi possível editar a mensagem: {message_id}")
+
+        mensagem_carregando = await bot.send_message(chat_id, "⏳ Carregando os dados, por favor aguarde um momento.")
+
+        prefixo_grupo = "OML" if grupo == "OMNIA" else "ONL"
+        lojas = [loja for loja in stores.keys() if loja.startswith(prefixo_grupo)]
+
+        # Obter os dados agregados de todas as lojas do grupo
+        dados_agregados = {
+            'total_vendas_com_iva': 0,
+            'total_vendas_sem_iva': 0,
+            'transacoes_vendas': 0,
+            'visitantes': 0,
+            'taxa_conversao': 0,
+            'tempo_medio_permanencia': 0,
+            'ticket_medio_com_iva': 0,
+            'ticket_medio_sem_iva': 0,
+            'unidades_por_transacao': 0,
+            'indice_devolucoes': 0,
+            'indice_descontos': 0,
+            'entry_rate': 0,
+            'top_vendedores': [],
+            'top_produtos': [],
+            'ultima_coleta': None,
+            'line4_in': 0,
+            'line4_out': 0,
+            'total_passagens': 0,
+            'ocupacao_regioes': {},
+        }
+
+        dados_agregados_anteriores = {
+            'total_vendas_com_iva': 0,
+            'total_vendas_sem_iva': 0,
+            'transacoes_vendas': 0,
+            'visitantes': 0,
+            'taxa_conversao': 0,
+            'tempo_medio_permanencia': 0,
+            'ticket_medio_com_iva': 0,
+            'ticket_medio_sem_iva': 0,
+            'unidades_por_transacao': 0,
+            'indice_devolucoes': 0,
+            'indice_descontos': 0,
+            'entry_rate': 0,
+            'top_vendedores': [],
+            'top_produtos': [],
+            'ultima_coleta': None,
+            'line4_in': 0,
+            'line4_out': 0,
+            'total_passagens': 0,
+            'ocupacao_regioes': {},
+        }
+
+        for loja in lojas:
+            resultados_atuais, resultados_anteriores = comparar_periodo_anterior(loja, inicio, fim, now)
+            for key, value in resultados_atuais.items():
+                if key in dados_agregados:
+                    if isinstance(value, list):
+                        dados_agregados[key].extend(value)
+                    elif isinstance(value, dict):
+                        for subkey, subvalue in value.items():
+                            if subkey in dados_agregados[key]:
+                                dados_agregados[key][subkey] += subvalue
+                            else:
+                                dados_agregados[key][subkey] = subvalue
+                    elif isinstance(value, (int, float)):
+                        dados_agregados[key] += value
+                    elif isinstance(value, datetime):
+                        if dados_agregados[key] is None or value > dados_agregados[key]:
+                            dados_agregados[key] = value
+                    else:
+                        logger.warning(f"Tipo de dado não suportado para agregação: {type(value)} para chave {key}")
+
+            for key, value in resultados_anteriores.items():
+                if key in dados_agregados_anteriores:
+                    if isinstance(value, list):
+                        dados_agregados_anteriores[key].extend(value)
+                    elif isinstance(value, dict):
+                        for subkey, subvalue in value.items():
+                            if subkey in dados_agregados_anteriores[key]:
+                                dados_agregados_anteriores[key][subkey] += subvalue
+                            else:
+                                dados_agregados_anteriores[key][subkey] = subvalue
+                    elif isinstance(value, (int, float)):
+                        dados_agregados_anteriores[key] += value
+                    elif isinstance(value, datetime):
+                        if dados_agregados_anteriores[key] is None or value > dados_agregados_anteriores[key]:
+                            dados_agregados_anteriores[key] = value
+                    else:
+                        logger.warning(f"Tipo de dado não suportado para agregação: {type(value)} para chave {key}")
+
+        # Calcular os três melhores vendedores
+        vendedores_agrupados = {}
+        for vendedor, valor in dados_agregados['top_vendedores']:
+            if vendedor in vendedores_agrupados:
+                vendedores_agrupados[vendedor] += valor
+            else:
+                vendedores_agrupados[vendedor] = valor
+        top_vendedores_agrupados = sorted(vendedores_agrupados.items(), key=lambda x: x[1], reverse=True)[:3]
+
+        # Calcular os cinco produtos mais vendidos
+        produtos_agrupados = {}
+        for item, descritivo, quantidade in dados_agregados['top_produtos']:
+            if item in produtos_agrupados:
+                produtos_agrupados[item]['quantidade'] += quantidade
+            else:
+                produtos_agrupados[item] = {'descritivo': descritivo, 'quantidade': quantidade}
+        top_produtos_agrupados = sorted(produtos_agrupados.items(), key=lambda x: x[1]['quantidade'], reverse=True)[:5]
+
+        saudacao = "Bom dia" if datetime.now().hour < 12 else "Boa tarde" if datetime.now().hour < 18 else "Boa noite"
+
+        # Preparar a resposta agregada
+        resposta = f"{saudacao}, {user_info.split(':')[1].split(',')[0]}! 🌞\n\n"
+        resposta += f"**Resumo para o grupo {grupo} de {inicio.strftime('%Y-%m-%d %H:%M')} a {fim.strftime('%Y-%m-%d %H:%M')}:** 📊\n\n"
+        resposta += f"**Indicadores de Desempenho:** 📈\n\n"
+        resposta += mostrar_resultados(dados_agregados['total_vendas_com_iva'], dados_agregados_anteriores['total_vendas_com_iva'], "Total de Vendas (c/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados(dados_agregados['total_vendas_sem_iva'], dados_agregados_anteriores['total_vendas_sem_iva'], "Total de Vendas (s/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados(dados_agregados['transacoes_vendas'], dados_agregados_anteriores['transacoes_vendas'], "Transações") + "\n"
+        resposta += mostrar_resultados(dados_agregados['visitantes'], dados_agregados_anteriores['visitantes'], "Visitantes") + "\n"
+        resposta += mostrar_resultados_percentual(dados_agregados['taxa_conversao'], dados_agregados_anteriores['taxa_conversao'], "Taxa de Conversão") + "\n"
+        resposta += mostrar_resultados_minutos(dados_agregados['tempo_medio_permanencia'], dados_agregados_anteriores['tempo_medio_permanencia'], "Tempo Médio de Permanência") + "\n"
+        resposta += mostrar_resultados(dados_agregados['total_passagens'], dados_agregados_anteriores['total_passagens'], "Número de Passagens") + "\n"
+        resposta += mostrar_resultados_percentual(dados_agregados['entry_rate'], dados_agregados_anteriores['entry_rate'], "Taxa de Captação") + "\n"
+        
+        resposta += "\n**Indicadores de Eficiência:** 🛠️\n\n"
+        resposta += mostrar_resultados(dados_agregados['ticket_medio_com_iva'], dados_agregados_anteriores['ticket_medio_com_iva'], "Ticket Médio (c/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados(dados_agregados['ticket_medio_sem_iva'], dados_agregados_anteriores['ticket_medio_sem_iva'], "Ticket Médio (s/ IVA)", monetario=True) + "\n"
+        resposta += mostrar_resultados_unidades(dados_agregados['unidades_por_transacao'], dados_agregados_anteriores['unidades_por_transacao'], "Unidades por Transação") + "\n"
+        resposta += mostrar_resultados_devolucoes(dados_agregados['indice_devolucoes'], dados_agregados_anteriores['indice_devolucoes'], "Índice de Devoluções") + "\n"
+        resposta += mostrar_resultados_descontos(dados_agregados['indice_descontos'], dados_agregados_anteriores['indice_descontos'], "Índice de Descontos") + "\n"
+        
+        resposta += "\n**Top Vendedores (s/IVA):** 🏅\n\n"
+        for vendedor, valor in top_vendedores_agrupados:
+            resposta += f"{vendedor}: €{valor:.0f}" + "\n"
+
+        resposta += "\n**Top Produtos (Qtd):** 🛒\n\n"
+        for item, info in top_produtos_agrupados:
+            resposta += f"{info['descritivo']} ({item}): {info['quantidade']:.0f} u." + "\n"
+
+        resposta += f"\nÚltima atualização dos dados: {resultados_atuais['ultima_coleta'].strftime('%Y-%m-%d %H:%M')} 📅\n\n"
+
+        resposta += f"**Período de comparação: {inicio_lp.strftime('%Y-%m-%d %H:%M')} a {fim_lp.strftime('%Y-%m-%d %H:%M')}:** 🕒\n\n"
+
+        resposta = escape_md(resposta)
+
+        await asyncio.sleep(3)
+        if mensagem_carregando:
+            await bot.delete_message(chat_id, mensagem_carregando.message_id)
+        await bot.send_message(chat_id, resposta, parse_mode='MarkdownV2')
+
+        # Adicionar botões de Nova Consulta e Sair
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Nova Consulta", callback_data="nova_consulta_grupo"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id, "📊 Deseja iniciar uma nova consulta ou sair?", reply_markup=markup)
+
+    except Exception as e:
+        logger.error(f"Erro ao processar grupo para consulta de agregado: {str(e)}", exc_info=True)
+        await asyncio.sleep(3)
+        if mensagem_carregando:
+            await bot.delete_message(chat_id, mensagem_carregando.message_id)
+        await bot.send_message(chat_id, "⚠️ Houve um problema. Por favor, utilize /consultargrupo para reiniciar o processo.")
+    finally:
+        session.close()
+
+async def cancelar_consulta(call: types.CallbackQuery):
+    try:
+        user_info = get_user_info(call.message)
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning(f"Mensagem não modificada: {call.message.message_id}")
+        
+        await call.answer("❌ Consulta cancelada pelo utilizador")
+        logger.info(f"Consulta cancelada pelo usuário {user_info}")
+        
+        await bot.send_message(call.message.chat.id, "❌ Consulta cancelada. Utilize /consultar para iniciar nova consulta ou /funcoes para listar todas as opções.")
+    except Exception as e:
+        logger.error(f"Erro ao cancelar consulta: {str(e)}", exc_info=True)
+        await bot.send_message(call.message.chat.id, f"Erro ao cancelar consulta: {str(e)}")
+
+async def process_heatmap_choice(call: types.CallbackQuery):
+    try:
+        _, loja, periodo = call.data.split(":")
+    except ValueError:
+        logger.error(f"Callback data format error: {call.data}")
+        await bot.send_message(chat_id=call.message.chat.id, text="⚠️ Formato de dados inválido. Por favor, utilize /consultar para tentar novamente.")
+        return
+
+    mensagem_carregando_heatmap = None
+    user_info = get_user_info(call.message)
+    try:
+        await call.answer(f"Opção selecionada: Heatmap")
+        logger.info(f"Opção selecionada: Heatmap para a loja {loja}, período {periodo} por {user_info}")
+
+        # Tente remover o markup, mas ignore o erro se não for possível
+        try:
+            await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except aiogram.utils.exceptions.MessageNotModified:
+            logger.warning(f"Mensagem já estava sem markup ou não pôde ser modificada: {call.message.message_id}")
+        except Exception as e:
+            logger.error(f"Erro inesperado ao tentar modificar o markup: {str(e)}")
+
+        mensagem_carregando_heatmap = await bot.send_message(call.message.chat.id, "🌡️ A gerar os mapas de calor, por favor aguarde um momento.")
+        
+        if periodo == "Customizado":
+            datas = user_states.get(call.message.chat.id, {})
+            inicio, fim = datas.get('data_hora_inicio'), datas.get('data_hora_fim')
+            if not (inicio and fim):
+                await bot.send_message(call.message.chat.id, "⚠️ Período customizado inválido. Utilize /consultar para tentar novamente.")
+                return
+        else:
+            inicio, fim, _, _ = obter_datas(periodo)
+
+        now = datetime.now()
+        if fim > now:
+            fim = now
+
+        sub_type = 1 if periodo in ["Hoje", "Ontem"] else 2 if periodo == "Esta Semana" else 3
+
+        ip_addresses = stores.get(loja, [])
+        for ip in ip_addresses:
+            heatmap_image = generate_heatmap(ip, inicio.strftime('%Y-%m-%d-%H-%M-%S'), fim.strftime('%Y-%m-%d-%H-%M-%S'), sub_type)
+            if heatmap_image:
+                await bot.send_photo(call.message.chat.id, heatmap_image)
+                heatmap_image.close()
+            else:
+                await bot.send_message(call.message.chat.id, f"⚠️ Não foi possível gerar o mapa de calor para o IP: {ip}")
+
+        if mensagem_carregando_heatmap:
+            await bot.delete_message(call.message.chat.id, mensagem_carregando_heatmap.message_id)
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Nova Consulta", callback_data="nova_consulta_lojas"))
+        markup.add(InlineKeyboardButton("Sair", callback_data="sair_para_inicial"))
+        await bot.send_message(chat_id=call.message.chat.id, text="✅ Processo concluído. Deseja iniciar uma nova consulta ou sair?", reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Erro ao processar escolha do heatmap: {str(e)}", exc_info=True)
+        if mensagem_carregando_heatmap:
+            await bot.delete_message(call.message.chat.id, mensagem_carregando_heatmap.message_id)
+        await bot.send_message(chat_id=call.message.chat.id, text="⚠️ Houve um problema ao processar sua escolha. Por favor, utilize /consultar para reiniciar o processo.")
+
+def consultar_dados_acumulados(loja, inicio, fim):
+    session = Session()
+    try:
+        dados = session.query(
+            func.strftime('%Y-%m-%d %H:00:00', PeopleCountingData.start_time).label('hora'),
+            func.sum(PeopleCountingData.line1_in + PeopleCountingData.line2_in + PeopleCountingData.line3_in).label('visitantes'),
+            func.sum(PeopleCountingData.total_in).label('conversoes')
+        ).filter(
+            PeopleCountingData.loja == loja,
+            PeopleCountingData.start_time >= inicio,
+            PeopleCountingData.end_time <= fim
+        ).group_by(
+            func.strftime('%Y-%m-%d %H:00:00', PeopleCountingData.start_time)
+        ).all()
+        
+        resultados = [{'hora': dado.hora, 'visitantes': dado.visitantes, 'conversoes': dado.conversoes} for dado in dados]
+        return resultados
+    except Exception as e:
+        logger.error(f"Erro ao buscar dados acumulados: {str(e)}", exc_info=True)
+        return []
+    finally:
+        session.close()
+
+async def process_flow_choice(call: types.CallbackQuery):
+    try:
+        data_parts = call.data.split(":")
+        if len(data_parts) != 4:
+            raise ValueError("Callback data format error")
+
+        _, choice, loja, periodo = data_parts
+        mensagem_carregando_fluxo = None
+        user_info = get_user_info(call.message)
+
+        await call.answer(f"Opção selecionada: {choice}")
+        logger.info(f"Opção selecionada: {choice} para o gráfico de fluxo da loja {loja}, período {periodo} por {user_info}")
+
+        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+
+        mensagem_carregando_fluxo = await bot.send_message(call.message.chat.id, "📈 A gerar o gráfico de fluxo, por favor aguarde um momento.")
+        
+        if periodo == "Customizado":
+            datas = user_states.get(call.message.chat.id, {})
+            inicio, fim = datas.get('data_hora_inicio'), datas.get('data_hora_fim')
+            if not (inicio and fim):
+                await bot.send_message(call.message.chat.id, "⚠️ Período customizado inválido. Utilize /consultar para tentar novamente.")
+                return
+        else:
+            inicio, fim, _, _ = obter_datas(periodo)
+
+        dados = consultar_dados_acumulados(loja, inicio, fim)
+
+        if not dados:
+            if mensagem_carregando_fluxo:
+                await bot.delete_message(call.message.chat.id, mensagem_carregando_fluxo.message_id)
+            await bot.send_message(call.message.chat.id, "⚠️ Não há dados disponíveis para gerar o gráfico de fluxo.")
+            return
+
+        horas = [dado['hora'] for dado in dados]
+        visitantes = [dado['visitantes'] for dado in dados]
+        conversoes = [dado['conversoes'] for dado in dados]
+
+        fig, ax1 = plt.subplots()
+
+        cor_barras = 'tab:blue'
+        ax1.set_xlabel('Hora do Dia')
+        ax1.set_ylabel('Visitantes', color=cor_barras)
+        ax1.bar(horas, visitantes, color=cor_barras, label='Visitantes')
+        ax1.tick_params(axis='y', labelcolor=cor_barras)
+
+        ax2 = ax1.twinx()
+        cor_linha = 'tab:red'
+        ax2.set_ylabel('Taxa de Conversão (%)', color=cor_linha)
+        ax2.plot(horas, conversoes, color=cor_linha, label='Taxa de Conversão (%)')
+        ax2.tick_params(axis='y', labelcolor=cor_linha)
+
+        fig.tight_layout()
+        plt.title(f"Gráfico de Fluxo - Loja {loja} - Período {periodo}")
+        ax1.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+
+        if mensagem_carregando_fluxo:
+            await bot.delete_message(call.message.chat.id, mensagem_carregando_fluxo.message_id)
+        await bot.send_photo(call.message.chat.id, buf)
+        buf.close()
+        await bot.send_message(call.message.chat.id, "✅ Processo concluído. Utilize /consultar para iniciar uma nova consulta.")
+    except ValueError as ve:
+        logger.error(f"Callback data format error: {call.data} - {ve}")
+        await bot.send_message(call.message.chat.id, "⚠️ Formato de dados inválido. Por favor, utilize /consultar para tentar novamente.")
+    except Exception as e:
+        logger.error(f"Erro ao processar escolha do gráfico de fluxo: {str(e)}", exc_info=True)
+        if mensagem_carregando_fluxo:
+            await bot.delete_message(call.message.chat.id, mensagem_carregando_fluxo.message_id)
+        await bot.send_message(call.message.chat.id, "⚠️ Houve um problema ao processar sua escolha. Por favor, utilize /consultar para reiniciar o processo.")
+
+async def enviar_mensagem_reinicio(chat_id):
+    await bot.send_message(chat_id, "🔄 Vamos lá voltar a conversar! Utilize /consultar para começar uma nova consulta ou /help para ver as instruções. 😃")
+
+async def enviar_mensagem_desligamento(chat_id):
+    await bot.send_message(chat_id, "⚠️ Estamos temporariamente fora do ar para melhorarmos a nossa ferramenta e trazer novas funcionalidades. Vamos notificá-lo assim que estivermos de volta. Até breve! 🚀✨")
+
+def signal_handler(sig, frame):
+    last_chat_id = get_last_chat_id()
+    if last_chat_id:
+        loop = asyncio.get_event_loop()
+        loop.create_task(enviar_mensagem_desligamento(last_chat_id))
+    logger.info("Bot desligado")
+    loop.stop()
+
+async def set_commands(bot: Bot):
+    commands = [
+        BotCommand(command="/start", description="Inicia o bot"),
+        BotCommand(command="/help", description="Mostra as instruções"),
+        BotCommand(command="/funcoes", description="Lista todas as funções disponíveis"),
+        BotCommand(command="/registo", description="Regista um novo usuário usando um código de convite"),
+        BotCommand(command="/consultar", description="Inicia uma consulta de vendas por loja"),
+        BotCommand(command="/consultargrupo", description="Inicia uma consulta de dados agregados por grupo"),
+        BotCommand(command="/exportardados", description="Exporta os dados em um arquivo Excel"),
+        BotCommand(command="/gerarconvite", description="Gera um convite para novos usuários (Admin)"),
+        BotCommand(command="/apagarutilizador", description="Remove um usuário do sistema (Admin)"),
+        BotCommand(command="/listarusuarios", description="Lista todos os usuários registrados (Admin)"),
+        BotCommand(command="/alterarnivel", description="Gera um código de alteração de nível de acesso (Admin)"),
+        BotCommand(command="/usarcodigo", description="Usa um código para alterar seu nível de acesso")
+    ]
+    await bot.set_my_commands(commands)
+
+import signal
+
+def signal_handler(sig, frame):
+    last_chat_id = get_last_chat_id()
+    if last_chat_id:
+        asyncio.create_task(enviar_mensagem_desligamento(last_chat_id))
+    logger.info("Bot desligado")
+    asyncio.get_event_loop().stop()
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Adicionar os handlers de callback
+async def handle_callbacks(call: types.CallbackQuery):
+    logger.info(f"Callback recebido: {call.data}")  # Log para verificar se os callbacks estão sendo recebidos corretamente
+    data = call.data
+
+    # Tenta remover os botões antigos, se houver, mas ignora erros específicos
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except (MessageNotModified, aiogram.utils.exceptions.MessageCantBeEdited) as e:
+        logger.warning(f"Mensagem não pode ser editada ou já foi modificada: {e}")
+        # Continue mesmo se a mensagem não puder ser editada ou já tiver sido modificada
+
+    # Tratar o callback de acordo com o dado recebido
+    if data == "menu_consultas":
+        await menu_consultas(call)
+    elif data == "menu_definicoes":
+        await menu_definicoes(call)
+    elif data == "menu_inicial":
+        await mostrar_menu_inicial(call.message)
+    elif data == "consultargrupo":
+        await consultar_grupo(call.message)
+    elif data == "consultar":
+        await consultar(call.message)
+    elif data == "exportardados":
+        await exportardados(call.message)
+    elif data == "listarusuarios":
+        await listar_usuarios(call)
+    elif data == "gerarconvite":
+        await gerar_convite(call)
+    elif data == "alterarnivel":
+        await gerar_codigo_alteracao(call)
+    elif data == "apagarutilizador":
+        await apagar_utilizador(call)
+    elif data == "registo":
+        await registo(call.message)
+    elif data == "usarcodigo":
+        await usarcodigo(call.message)
+    elif data == "help":
+        await send_help(call.message)
+    elif data.startswith('consultar_selecionar_grupo:'):
+        await processar_selecao_grupo(call)
+    elif data.startswith('consultar_selecionar_loja:'):
+        await processar_selecao_loja(call)
+    elif data.startswith('nivel_acesso_convite:'):
+        await processar_nivel_acesso_convite(call)
+    elif data.startswith('grupo_convite:'):
+        await processar_grupo_convite(call)
+    elif data.startswith('loja_convite:'):
+        await processar_loja_convite(call)
+    elif data.startswith('nivel_acesso_alteracao:'):
+        await processar_nivel_acesso_alteracao(call)
+    elif data.startswith('consultar_grupo:'):
+        await processar_consultar_grupo(call)
+    elif data.startswith('periodo_grupo:'):
+        await process_periodo_grupo_step(call)
+    elif data.startswith('exportar_grupo:'):
+        await process_exportar_grupo(call)
+    elif data.startswith('exportar_loja:'):
+        await process_exportar_loja(call)
+    elif data.startswith('periodo:'):
+        await process_periodo_step(call)
+    elif data == "nova_consulta_lojas":
+        await processar_nova_consulta_lojas(call)
+    elif data == "nova_consulta_grupo":
+        await processar_nova_consulta_grupo(call)
+    elif data.startswith('heatmap:'):  # Adiciona o tratamento para "heatmap"
+        await process_heatmap_choice(call)
+    elif data == "nova_consulta_exportar":
+        await exportardados(call.message)
+    elif data == "nova_consulta_gerar_convite":
+        await gerar_convite(call)
+    elif data == "nova_consulta_alterar_nivel":
+        await gerar_codigo_alteracao(call)
+    elif data == "nova_consulta_apagar_utilizador":
+        await apagar_utilizador(call)
+    elif data == "sair_para_inicial":
+        await mostrar_menu_inicial(call.message)
+    elif data.startswith('grupo_alteracao:'):
+        await processar_grupo_alteracao(call)
+    elif data.startswith('loja_alteracao:'):
+        await processar_loja_alteracao(call)
+    elif data.startswith('codigo_alteracao:'):
+        await processar_codigo_alteracao(call)
+    elif data == "sair_para_inicial":
+        await process_heatmap_choice(call)
+ 
+    # Feedback para o usuário
+    await call.answer()
+
+async def main():
+    global bot, dp
+
+    # Carregar dados dos arquivos JSON
+    load_user_data()
+    load_invites()
+    load_alteration_codes()
+    load_super_admin()
+
+    bot = Bot(token=TELEGRAM_TOKEN_QA)
+    dp = Dispatcher(bot)
+
+    # Definir comandos
+    await set_commands(bot)
+
+# Registrando handlers
+    dp.register_message_handler(handle_heavy_task, commands=['start_heavy_task'])
+    dp.register_message_handler(send_welcome, commands=['start'])
+    dp.register_message_handler(send_help, commands=['help'])
+    dp.register_message_handler(listar_funcoes, commands=['funcoes'])
+    dp.register_message_handler(registo, commands=['registo'])
+    dp.register_message_handler(consultar, commands=['consultar'])
+    dp.register_message_handler(consultar_grupo, commands=['consultargrupo'])
+    dp.register_message_handler(gerar_convite, commands=['gerarconvite'])
+    dp.register_message_handler(apagar_utilizador, commands=['apagarutilizador'])
+    dp.register_message_handler(listar_usuarios, commands=['listarusuarios'])
+    dp.register_message_handler(gerar_codigo_alteracao, commands=['alterarnivel'])
+    dp.register_message_handler(usarcodigo, commands=['usarcodigo'])
+    dp.register_message_handler(exportardados, commands=['exportardados'])
+    dp.register_message_handler(processar_nivel_acesso_convite, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'codigo_convite')
+    dp.register_message_handler(processar_apagar_usuario, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'apagar_usuario')
+    dp.register_message_handler(processar_codigo_alteracao, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'codigo_alteracao')
+    dp.register_message_handler(processar_data_hora_inicio, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'data_hora_inicio')
+    dp.register_message_handler(processar_data_hora_fim, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'data_hora_fim')
+    dp.register_message_handler(processar_data_hora_inicio_exportar, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'data_hora_inicio_exportar')
+    dp.register_message_handler(processar_data_hora_fim_exportar, lambda message: message.chat.id in user_states and user_states[message.chat.id]['step'] == 'data_hora_fim_exportar')
+
+    dp.register_callback_query_handler(handle_callbacks)  # Registra o handler de callback
+
+    dp.register_callback_query_handler(processar_selecao_grupo, lambda call: call.data.startswith('consultar_selecionar_grupo:'))
+    dp.register_callback_query_handler(processar_selecao_loja, lambda call: call.data.startswith('consultar_selecionar_loja:'))
+    dp.register_callback_query_handler(processar_nivel_acesso_convite, lambda call: call.data.startswith('nivel_acesso_convite:'))
+    dp.register_callback_query_handler(processar_grupo_convite, lambda call: call.data.startswith('grupo_convite:'))
+    dp.register_callback_query_handler(processar_loja_convite, lambda call: call.data.startswith('loja_convite:'))
+    dp.register_callback_query_handler(processar_nivel_acesso_alteracao, lambda call: call.data.startswith('nivel_acesso_alteracao:'))
+    dp.register_callback_query_handler(processar_grupo_alteracao, lambda call: call.data.startswith('grupo_alteracao:'))
+    dp.register_callback_query_handler(processar_loja_alteracao, lambda call: call.data.startswith('loja_alteracao:'))
+    dp.register_callback_query_handler(processar_consultar_grupo, lambda call: call.data.startswith('consultar_grupo:'))
+    dp.register_callback_query_handler(process_periodo_grupo_step, lambda call: call.data.startswith('periodo_grupo:'))
+    dp.register_callback_query_handler(process_exportar_grupo, lambda call: call.data.startswith('exportar_grupo:'))
+    dp.register_callback_query_handler(process_exportar_loja, lambda call: call.data.startswith('exportar_loja:'))
+    dp.register_callback_query_handler(process_periodo_step, lambda call: call.data.startswith('periodo:'))
+    dp.register_callback_query_handler(cancelar_consulta, lambda call: call.data == 'sair_para_inicial')
+    dp.register_callback_query_handler(process_heatmap_choice, lambda call: call.data.startswith('heatmap:'))
+    dp.register_callback_query_handler(process_flow_choice, lambda call: call.data.startswith('fluxo:'))
+    dp.register_callback_query_handler(processar_nova_consulta_grupo, lambda call: call.data == 'nova_consulta_grupo')
+    dp.register_callback_query_handler(processar_nova_consulta_lojas, lambda call: call.data == 'nova_consulta_lojas')
+    dp.register_callback_query_handler(lambda call: exportardados(call.message), lambda call: call.data == 'nova_consulta_exportar')
+    dp.register_callback_query_handler(lambda call: mostrar_menu_inicial(call.message), lambda call: call.data == 'sair_para_inicial')
+
+    dp.register_callback_query_handler(lambda call: gerar_convite(call), lambda call: call.data == 'nova_consulta_gerar_convite')
+    dp.register_callback_query_handler(lambda call: gerar_codigo_alteracao(call), lambda call: call.data == 'nova_consulta_alterar_nivel')
+    dp.register_callback_query_handler(lambda call: apagar_utilizador(call), lambda call: call.data == 'nova_consulta_apagar_utilizador')
+
+    # Adicionando os handlers de saída para os novos comandos
+    dp.register_callback_query_handler(lambda call: send_help(call.message), lambda call: call.data == 'sair_para_inicial')
+    dp.register_callback_query_handler(lambda call: listar_funcoes(call.message), lambda call: call.data == 'sair_para_inicial')
+    dp.register_callback_query_handler(lambda call: listar_usuarios(call.message), lambda call: call.data == 'sair_para_inicial')
+    dp.register_callback_query_handler(lambda call: process_heatmap_choice(call.message), lambda call: call.data == 'sair_para_inicial')
+    
+    try:
+        await dp.start_polling()
+    except Exception as e:
+        logger.error(f"Erro durante a execução do bot: {str(e)}", exc_info=True)
+        raise
+    finally:
+        await bot.close()
+
+if __name__ == '__main__':
+    load_super_admin()
+    if super_admin.get('chat_id'):
+        asyncio.run(main())
+    else:
+        print("Super Admin não está definido. Por favor, configure o Super Admin no arquivo super_admin.json.")   

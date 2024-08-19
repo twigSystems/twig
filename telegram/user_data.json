@@ -1,0 +1,100 @@
+{
+    "6720946402": {
+        "nivel_acesso": "Gestor de Grupo",
+        "grupo": "ONLY",
+        "loja": "Todas",
+        "username": "Diogo",
+        "update_notified": true
+    },
+    "7329491656": {
+        "nivel_acesso": "Admin",
+        "grupo": "Todos",
+        "loja": "Todas",
+        "username": "Gil",
+        "update_notified": false
+    },
+    "1008516080": {
+        "nivel_acesso": "Admin",
+        "grupo": "Todos",
+        "loja": "Todas",
+        "username": "J",
+        "update_notified": false
+    },
+    "7143184542": {
+        "nivel_acesso": "Geral",
+        "grupo": "Todos",
+        "loja": "Todas",
+        "username": "Maria",
+        "update_notified": true
+    },
+    "6935521573": {
+        "nivel_acesso": "Admin",
+        "grupo": "Todos",
+        "loja": "Todas",
+        "username": "Marta",
+        "update_notified": false
+    },
+    "6973693273": {
+        "nivel_acesso": "Lojista",
+        "grupo": "OMNIA",
+        "loja": "OML01-Omnia Guimar\u00e3esShopping",
+        "username": "Ana",
+        "update_notified": false
+    },
+    "7242572099": {
+        "nivel_acesso": "Lojista",
+        "grupo": "OMNIA",
+        "loja": "OML03-Omnia Norteshopping",
+        "username": "Omnia",
+        "update_notified": false
+    },
+    "7087669773": {
+        "nivel_acesso": "Geral",
+        "grupo": "Todos",
+        "loja": "Todas",
+        "username": "Alexandre",
+        "update_notified": false
+    },
+    "6088034487": {
+        "nivel_acesso": "Gestor de Loja",
+        "grupo": "ONLY",
+        "loja": "ONL01-Only UBBO Amadora",
+        "username": "Jo\u00e3o",
+        "update_notified": false
+    },
+    "7326578612": {
+        "nivel_acesso": "Lojista",
+        "grupo": "OMNIA",
+        "loja": "OML01-Omnia Guimar\u00e3esShopping",
+        "username": "OMNIA",
+        "update_notified": false
+    },
+    "7211790356": {
+        "nivel_acesso": "Gestor de Grupo",
+        "grupo": "ONLY",
+        "loja": "Todas",
+        "username": "Joana",
+        "update_notified": false
+    },
+    "1065318110": {
+        "username": "twigsystems",
+        "nivel_acesso": "Super Admin",
+        "grupo": "Todos",
+        "loja": "Todas",
+        "update_notified": true
+    },
+    "7242853389": {
+        "nivel_acesso": "Gestor de Grupo",
+        "grupo": "OMNIA",
+        "loja": "Todas",
+        "username": "Patr\u00edcia",
+        "update_notified": false
+    },
+    "7399481328": {
+        "nivel_acesso": "Gestor de Grupo",
+        "grupo": "ONLY",
+        "loja": "Todas",
+        "username": "Susana",
+        "update_notified": false
+    }
+}
