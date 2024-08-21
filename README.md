@@ -37,6 +37,6 @@ Licença
 Este projeto é licenciado sob a Licença MIT.
 
 Contato
-Para suporte ou dúvidas, entre em contato via email@example.com.
+Para suporte ou dúvidas, entre em contato via pedro@twig.systems.
 
 Screenshots e Diagrama
